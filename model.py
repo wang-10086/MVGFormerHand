@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import math
+from scipy.optimize import linear_sum_assignment
 
 
 # ------------------------------------------------------------------------------------------------
@@ -71,7 +72,7 @@ def batch_project_points(points_3d, cameras, img_size):
 
     # 3. Camera -> Pixel: u = fx*X/Z + cx
     # 避免除以 0
-    eps = 1e-5
+    eps = 0.1
     z = pts_cam[..., 2].clamp(min=eps)
     x = pts_cam[..., 0]
     y = pts_cam[..., 1]
@@ -326,6 +327,62 @@ class Backbone(nn.Module):
         return features  # List of [C=256, H, W] tensors
 
 
+class HungarianMatcher(nn.Module):
+    """
+    基于匈牙利算法的二分图匹配器
+    Cost = cost_class * (-prob) + cost_pose * L1_dist
+    """
+
+    def __init__(self, cost_class=2.0, cost_pose=5.0):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_pose = cost_pose
+
+    @torch.no_grad()
+    def forward(self, pred_logits, pred_poses, gt_poses):
+        """
+        Args:
+            pred_logits: (B, N_inst, 1) 每个实例的平均置信度 (经过 Sigmoid)
+            pred_poses: (B, N_inst, 21, 3) 预测的 3D 姿态
+            gt_poses: (B, 21, 3) 真实的 3D 姿态 (假设单手)
+        Returns:
+            indices: List[Tuple], 长度为 B. [(src_idx, tgt_idx), ...]
+        """
+        bs, num_inst = pred_logits.shape[:2]
+        indices = []
+
+        # 循环处理 batch (scipy 不支持 batch)
+        for b in range(bs):
+            # 1. 准备数据
+            # prob: (N_inst, 1)
+            p_prob = pred_logits[b]
+            # pose: (N_inst, 21, 3)
+            p_pose = pred_poses[b]
+            # gt: (21, 3) -> (1, 21, 3) 用于广播
+            t_pose = gt_poses[b].unsqueeze(0)
+
+            # 2. 计算代价 (Cost)
+            # A. 分类代价: 我们希望 prob 越大越好 -> -prob 越小越好
+            C_class = -p_prob
+
+            # B. 姿态代价: L1 距离
+            # sum(dim=(1,2)) 将 21 个关节和 xyz 维度求和 -> (N_inst,)
+            C_pose = torch.abs(p_pose - t_pose).sum(dim=(1, 2)).unsqueeze(-1)  # (N_inst, 1)
+
+            # C. 总代价
+            C = self.cost_class * C_class + self.cost_pose * C_pose
+
+            # 3. 匈牙利匹配
+            # linear_sum_assignment 寻找最小代价的指派
+            # C squeeze 后变成 (N_inst,) 向量，scipy 会自动找最小的那个索引
+            C_cpu = C.squeeze(-1).cpu().numpy().reshape(-1, 1)
+            row_ind, col_ind = linear_sum_assignment(C_cpu)
+
+            indices.append((torch.as_tensor(row_ind, dtype=torch.int64),
+                            torch.as_tensor(col_ind, dtype=torch.int64)))
+
+        return indices
+
 # ------------------------------------------------------------------------------------------------
 # 5. 主模型 (MVGFormerHand)
 # ------------------------------------------------------------------------------------------------
@@ -356,6 +413,8 @@ class MVGFormerHand(nn.Module):
         # 可以是随机初始化，或者初始化在空间中心
         # 这里使用 Learnable Linear Layer 从 Query 生成初始位置
         self.ref_point_head = nn.Linear(cfg.DECODER.d_model, 3)
+
+        self.matcher = HungarianMatcher(cost_class=2.0, cost_pose=5.0)
 
     def forward(self, views, meta):
         """
@@ -405,71 +464,123 @@ class MVGFormerHand(nn.Module):
             ]
         }
 
-        # 5. Loss 计算 (修复的核心部分)
+        # 5. 损失计算
         loss_dict = {}
+
+        # 确保处于训练模式且有 GT
         if self.training and meta is not None:
-            # 获取 GT: (B, 21, 3) - 假设单手
-            gt_poses = torch.stack([m['joints_3d'] for m in meta]).squeeze(1)
-            # 确保 gt_poses 是 (B, 21, 3)
-            if gt_poses.dim() == 4: gt_poses = gt_poses.squeeze(1)
+            # -----------------------------------------------------------------
+            # 1. 数据准备
+            # -----------------------------------------------------------------
 
-            # 获取预测: (B, N_inst*21, 3)
+            # 获取 GT: (B, 21, 3)
+            device = outputs['pred_logits'].device
+            gt_poses = torch.stack([m['joints_3d'] for m in meta])
+            if gt_poses.dim() == 4: gt_poses = gt_poses.squeeze(1)  # (B, 21, 3)
+            gt_poses = gt_poses.to(device)  # 确保在 GPU
+
+            # 获取预测并 Reshape
+            # 原始 pred_poses 通常是 (B, N_inst*21, 3)
+            # 我们需要把它变成 (B, N_inst, 21, 3) 以便按“只手”进行匹配
             pred_pose_all = outputs['pred_poses']['outputs_coord']
-
-            # --- 简单匹配逻辑 (Simple Matcher) ---
-            # 因为只有 1 只手 GT，我们计算所有 Instance 预测与 GT 的距离，取最小的那个作为 Loss
-            # Reshape pred to (B, N_inst, 21, 3)
             pred_pose_reshaped = pred_pose_all.view(B, self.num_instance, self.num_joints, 3)
 
-            # 计算每个 instance 的 L1 距离 (B, N_inst)
-            # gt_poses.unsqueeze(1): (B, 1, 21, 3)
-            dist = torch.abs(pred_pose_reshaped - gt_poses.unsqueeze(1)).sum(dim=(2, 3))
+            # 获取分类 Logits 并处理成 Instance 粒度
+            # 原始 logits: (B, N_inst*21, 1) -> (B, N_inst, 1)
+            # 取 21 个关节的平均分作为这只手的得分
+            pred_logits_inst = outputs['pred_logits'].view(B, self.num_instance, self.num_joints, 1).mean(dim=2)
+            pred_probs_inst = pred_logits_inst.sigmoid()  # 转概率用于 Matcher
 
-            # 找到每个样本 loss 最小的 instance索引
-            min_dist, min_idx = torch.min(dist, dim=1)  # (B,)
+            # -----------------------------------------------------------------
+            # 2. 执行匈牙利匹配
+            # -----------------------------------------------------------------
 
-            # 选出最优预测 calculate final loss
-            # select_pred: (B, 21, 3)
-            selected_pred = torch.stack([pred_pose_reshaped[b, min_idx[b]] for b in range(B)])
+            # 获取匹配索引 [(src_idx, tgt_idx), ...]
+            # src_idx: 选中的预测手索引, tgt_idx: 对应的 GT 手索引(通常是0)
+            match_indices = self.matcher(pred_probs_inst, pred_pose_reshaped, gt_poses)
 
-            # --- A. 3D L1 Loss ---
+            # -----------------------------------------------------------------
+            # 3. 提取最优预测结果 (用于计算 Loss)
+            # -----------------------------------------------------------------
+
+            selected_pred_list = []
+            target_classes = torch.zeros(B, self.num_instance).to(device)  # 初始化分类标签全 0
+
+            for b in range(B):
+                src_idx, tgt_idx = match_indices[b]
+                best_idx = src_idx.item()  # 匹配到的最佳预测索引
+
+                # A. 提取用于回归的 Pose
+                selected_pred_list.append(pred_pose_reshaped[b, best_idx])
+
+                # B. 设置分类标签: 只有匹配到的这个是正样本 (1)
+                target_classes[b, best_idx] = 1.0
+
+            # 堆叠得到最优预测 (B, 21, 3)
+            selected_pred = torch.stack(selected_pred_list)
+
+            # -----------------------------------------------------------------
+            # 4. 计算具体 Loss
+            # -----------------------------------------------------------------
+
+            # --- Loss A: 3D L1 Loss ---
             loss_dict['loss_pose_perjoint'] = F.l1_loss(selected_pred, gt_poses)
 
-            # --- B. 2D Projection Loss (新增) ---
-            # 投影回 2D 计算像素误差
-            # batch_project_points 返回 grid (B, V, N_q, 2) in [-1, 1]
-            # 我们需要像素坐标
-            grid_norm, mask = batch_project_points(selected_pred, cameras_stacked, img_size)
-
-            # [-1, 1] -> [0, W]
+            # --- Loss B: 2D Projection Loss (带安全锁) ---
+            # 1. 提取相机参数
+            Ks = cameras_stacked['camera_Intri']  # (B, V, 3, 3)
+            Rs = cameras_stacked['camera_R']
+            Ts = cameras_stacked['camera_T']
             H, W = img_size
-            u = (grid_norm[..., 0] + 1) * (W - 1) / 2
-            v = (grid_norm[..., 1] + 1) * (H - 1) / 2
-            pred_uv = torch.stack([u, v], dim=-1)  # (B, V, 21, 2)
 
-            # 构造 GT 2D: (B, V, 21, 2)
-            # 我们需要重新投影 GT 3D 得到 GT 2D (因为 adapter 没有传 2D GT，或者可以直接用 adapter 传的 2D GT)
-            # 为了自洽，这里重新投影 GT 3D
-            gt_grid_norm, gt_mask = batch_project_points(gt_poses, cameras_stacked, img_size)
-            gt_u = (gt_grid_norm[..., 0] + 1) * (W - 1) / 2
-            gt_v = (gt_grid_norm[..., 1] + 1) * (H - 1) / 2
-            gt_uv = torch.stack([gt_u, gt_v], dim=-1)
+            # 2. 预测点 World -> Camera
+            # (B, 21, 3) -> (B, V, 21, 3)
+            pred_3d_exp = selected_pred.unsqueeze(1).expand(-1, V, -1, -1)
+            pred_cam = torch.matmul(pred_3d_exp, Rs.transpose(-1, -2)) + Ts.unsqueeze(2)
 
+            # 3. 深度安全锁 (Z-Clamp)
+            pred_z = pred_cam[..., 2].clamp(min=0.1)  # 最小 10cm，防止除零
+            pred_x = pred_cam[..., 0]
+            pred_y = pred_cam[..., 1]
+
+            # 4. 投影计算
+            fx = Ks[..., 0, 0].unsqueeze(2)
+            fy = Ks[..., 1, 1].unsqueeze(2)
+            cx = Ks[..., 0, 2].unsqueeze(2)
+            cy = Ks[..., 1, 2].unsqueeze(2)
+
+            pred_u = pred_x * fx / pred_z + cx
+            pred_v = pred_y * fy / pred_z + cy
+
+            # 5. 坐标截断 (Pixel-Clamp) 防止梯度爆炸
+            pred_u = pred_u.clamp(min=-W, max=2 * W)
+            pred_v = pred_v.clamp(min=-H, max=2 * H)
+            pred_uv = torch.stack([pred_u, pred_v], dim=-1)
+
+            # 6. 生成 GT 的 2D 投影 (作为 Target)
+            # 重新投影 GT 3D -> 2D
+            gt_3d_exp = gt_poses.unsqueeze(1).expand(-1, V, -1, -1)  # (B, V, 21, 3)
+            gt_cam = torch.matmul(gt_3d_exp, Rs.transpose(-1, -2)) + Ts.unsqueeze(2)
+            # 深度保护
+            gt_z = gt_cam[..., 2].clamp(min=0.01)
+            # [修改点] 直接使用 fx, cx (形状 B,V,1)，不要 squeeze
+            # gt_cam[..., 0] 是 (B, V, 21)
+            # fx 是 (B, V, 1)
+            # 结果是 (B, V, 21) -> 符合广播规则
+            gt_u_target = gt_cam[..., 0] * fx / gt_z + cx
+            gt_v_target = gt_cam[..., 1] * fy / gt_z + cy
+            gt_uv = torch.stack([gt_u_target, gt_v_target], dim=-1)
+
+            # 计算 2D Loss
             loss_dict['loss_pose_perprojection_2d'] = F.l1_loss(pred_uv, gt_uv)
 
-            # --- C. Classification Loss ---
-            # 简单的二分类：选中的 instance 是正样本(1)，其他是负样本(0)
-            pred_logits = outputs['pred_logits']  # (B, N_inst*21, 1) or (B, N_inst, 1)?
-            # model __init__ 中 class_embed 是 (d_model, 1)，输入是 query_embed (N_inst*21)
-            # 我们只需要对 instance 打分，通常取 21 个关节特征的平均值
-            pred_logits_inst = pred_logits.view(B, self.num_instance, self.num_joints, 1).mean(dim=2).squeeze(
-                -1)  # (B, N_inst)
-
-            target_classes = torch.zeros_like(pred_logits_inst)
-            for b in range(B):
-                target_classes[b, min_idx[b]] = 1.0  # 只有匹配到的那个是 1
-
-            loss_dict['loss_ce'] = F.binary_cross_entropy_with_logits(pred_logits_inst, target_classes)
+            # --- Loss C: Classification Loss ---
+            # pred_logits_inst.squeeze(-1) shape: (B, N_inst)
+            # target_classes shape: (B, N_inst)
+            loss_dict['loss_ce'] = F.binary_cross_entropy_with_logits(
+                pred_logits_inst.squeeze(-1),
+                target_classes
+            )
 
         return outputs, loss_dict
 

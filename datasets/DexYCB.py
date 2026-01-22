@@ -29,11 +29,18 @@ class DEXYCBDatasets(Dataset):
         self.calibration_dir = os.path.join(root_dir, 'calibration/calibration')
         self.data_split = split
 
+        # 定义标准 ImageNet 归一化参数
+        self.normalize = standard.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+
         # 仅保留 Resize 和 ToTensor，移除 Normalize
         # 这样 img 数据范围是 [0, 1]，方便直接可视化
         self.transform = standard.Compose([
             standard.Resize(cfg.input_img_shape),
             standard.ToTensor(),
+            self.normalize,
         ])
 
         self.samples = self._collect_samples()
@@ -42,41 +49,63 @@ class DEXYCBDatasets(Dataset):
 
     def _collect_samples(self):
         # -----------------------------------------------------------
-        # [控制配置] 在这里硬编码控制加载的被试数量
-        # 设置为 None 则加载所有被试
-        # 设置为 整数 (如 2) 则只加载前 2 个被试
-        MAX_SUBJECTS = 1
+        # [控制配置] 硬编码调试参数
+        # 1. 限制加载的被试数量 (None 表示全部)
+        MAX_SUBJECTS = 2
+
+        # 2. [新增] 限制每个被试下的序列数量 (None 表示全部)
+        # 例如设置为 1，则每个被试只加载它的第 1 个视频序列
+        MAX_SEQUENCES_PER_SUBJECT = 20
         # -----------------------------------------------------------
 
         samples = []
         global_idx = 0
 
-        # 获取所有可能的被试目录
+        # --- 1. 获取并限制被试 ---
         subjects = sorted([
             d for d in os.listdir(self.root_dir)
             if os.path.isdir(os.path.join(self.root_dir, d)) and d != "calibration"
         ])
 
-        # 应用数量限制
         if MAX_SUBJECTS is not None and isinstance(MAX_SUBJECTS, int):
-            original_count = len(subjects)
+            original_cnt = len(subjects)
             subjects = subjects[:MAX_SUBJECTS]
-            print(
-                f"!!! [Dataset Limitation] Restricting to first {len(subjects)} subjects (Original: {original_count}): {subjects}")
+            print(f"!!! [Limit] Subjects restricted: {len(subjects)}/{original_cnt}")
 
         for subject_dir in subjects:
             subject_path = os.path.join(self.root_dir, subject_dir)
-            for seq_dir in sorted(os.listdir(subject_path)):
-                seq_path = os.path.join(subject_path, seq_dir)
-                if not os.path.isdir(seq_path): continue
 
+            # --- 2. 获取并限制序列 ---
+            # 先过滤出所有有效的序列目录
+            all_seqs = sorted([
+                d for d in os.listdir(subject_path)
+                if os.path.isdir(os.path.join(subject_path, d))
+            ])
+
+            # 应用序列数量限制
+            if MAX_SEQUENCES_PER_SUBJECT is not None and isinstance(MAX_SEQUENCES_PER_SUBJECT, int):
+                target_seqs = all_seqs[:MAX_SEQUENCES_PER_SUBJECT]
+            else:
+                target_seqs = all_seqs
+
+            # print(f"  - Subject {subject_dir}: Loading {len(target_seqs)} sequences")
+
+            for seq_dir in target_seqs:
+                seq_path = os.path.join(subject_path, seq_dir)
+
+                # 计算该序列下的帧数 (通过任意一个视角文件夹判断)
                 count = 0
-                for view_dir in sorted(os.listdir(seq_path)):
+                # 遍历所有视角文件夹找到一个存在的来计算帧数
+                possible_views = sorted(os.listdir(seq_path))
+                for view_dir in possible_views:
                     view_path = os.path.join(seq_path, view_dir)
                     if os.path.isdir(view_path):
+                        # 简单统计 jpg 数量
                         count = sum(1 for f in os.listdir(view_path) if f.endswith('.jpg'))
-                        break
+                        if count > 0:
+                            break
 
+                # 添加样本
                 for sample in range(count):
                     samples.append({
                         "subject": subject_dir,
@@ -85,6 +114,7 @@ class DEXYCBDatasets(Dataset):
                         "idx": global_idx
                     })
                     global_idx += 1
+
         return samples
 
     def __len__(self):
@@ -119,7 +149,6 @@ class DEXYCBDatasets(Dataset):
 
             # --- 1. 图像处理 ---
             img_pil = Image.open(rgb_path).convert('RGB')
-            # 保留原始图像
             ori_img = np.array(img_pil)
             orig_width, orig_height = img_pil.size
 
@@ -146,12 +175,10 @@ class DEXYCBDatasets(Dataset):
             world_joints_3d = camera2world(cam_joints_3d, extrinsic)
             joints_uvd = xyz2uvd(cam_joints_3d, intrinsic)
 
-            # --- 4. 核心调整: 仅做 Resize 适配 ---
-            # 像素坐标适配 256x256
+            # --- 4. 核心调整: Resize 适配 ---
             joints_uvd[:, 0] *= scale_x
             joints_uvd[:, 1] *= scale_y
 
-            # 内参适配 256x256
             intrinsic[0, 0] *= scale_x
             intrinsic[1, 1] *= scale_y
             intrinsic[0, 2] *= scale_x
@@ -162,8 +189,8 @@ class DEXYCBDatasets(Dataset):
             inputs['extrinsic'].append(extrinsic.astype(np.float32))
             inputs['intrinsic'].append(intrinsic.astype(np.float32))
 
-            targets['mesh_pose_uvd'].append(joints_uvd.astype(np.float32))  # 存的是 resize 后的像素坐标
-            targets['mesh_pose_xyz'].append(cam_joints_3d.astype(np.float32))  # 存的是绝对相机坐标
+            targets['mesh_pose_uvd'].append(joints_uvd.astype(np.float32))
+            targets['mesh_pose_xyz'].append(cam_joints_3d.astype(np.float32))
             targets['intrinsic'].append(intrinsic.astype(np.float32))
             targets['extrinsic'].append(extrinsic.astype(np.float32))
             targets['world_coord'].append(world_joints_3d.astype(np.float32))
@@ -203,26 +230,17 @@ if __name__ == "__main__":
 
         view_idx = 0
 
-        # --- 可视化核心修改 ---
-        # 1. 直接使用 Network Input Image (256x256)
-        # inputs['img'] 形状是 (V, C, H, W)，需要取出第0个视角并转置为 (H, W, C)
+        # --- 可视化 ---
         img_vis = inputs['img'][view_idx].transpose(1, 2, 0)
-
-        # 2. 直接使用 2D Keypoints (256x256)
-        # 这里的 uvd 已经是乘过 scale_x/y 的，直接对应 img_vis
         uvd = targets['mesh_pose_uvd'][view_idx]
 
         fig, ax = plt.subplots(figsize=(6, 6))
-
-        # 显示图片 (img_vis 是 float 0-1 范围，imshow 可以直接处理)
         ax.imshow(img_vis)
 
-        # 绘制点
         x = uvd[:, 0]
         y = uvd[:, 1]
         ax.scatter(x, y, c='r', s=20, label='Joints')
 
-        # 绘制骨架
         bones = [
             (0, 1), (1, 2), (2, 3), (3, 4),
             (0, 5), (5, 6), (6, 7), (7, 8),
@@ -239,12 +257,7 @@ if __name__ == "__main__":
         ax.axis('off')
         plt.show()
 
-        # 打印信息验证
         print(f"Image Shape: {img_vis.shape}")
-        print(f"Joint Range X: {x.min():.1f} - {x.max():.1f}")
-        print(f"Joint Range Y: {y.min():.1f} - {y.max():.1f}")
-
-        # 3D 验证 (世界坐标)
         print("Visualizing World Coordinates...")
         visualize_3d_joints(targets['world_coord'][view_idx])
 

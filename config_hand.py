@@ -8,8 +8,8 @@ _C = CN()
 # -----------------------------------------------------------------------------
 _C.MULTI_PERSON = CN()
 # 定义 3D 搜索空间的物理尺寸 (单位: 米)
-# 假设手部活动范围是一个 0.8m 的立方体
-_C.MULTI_PERSON.SPACE_SIZE = [0.8, 0.8, 0.8]
+# 假设手部活动范围是一个 1.6m 的立方体
+_C.MULTI_PERSON.SPACE_SIZE = [1.6, 1.6, 1.6]
 # 空间的中心坐标 (单位: 米)，根据你的世界坐标系原点调整
 # 如果 DexYCB 的世界坐标原点在桌面上，这里设为 [0.0, 0.0, 0.2] 可能比较合适
 _C.MULTI_PERSON.SPACE_CENTER = [0.0, 0.0, 0.0]
@@ -40,7 +40,7 @@ _C.DECODER.num_feature_levels = 3   # 使用 ResNet 的 Layer 2,3,4 多尺度特
 _C.DECODER.dec_n_points = 4         # Deformable Attention 采样点数
 _C.DECODER.num_decoder_layers = 4   # 迭代层数
 _C.DECODER.return_intermediate_dec = True
-_C.DECODER.num_instance = 10        # Query 数量：设为 10 个足矣，最后取置信度最高的
+_C.DECODER.num_instance = 100        # Query 数量：设为 10 个足矣，最后取置信度最高的
 _C.DECODER.num_keypoints = 21       # 对应 21 个关节 Query
 _C.DECODER.with_pose_refine = True
 _C.DECODER.aux_loss = True          # 使用辅助 Loss
