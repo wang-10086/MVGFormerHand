@@ -47,6 +47,7 @@ def collate_dexycb_to_mvgformer(batch_inputs, batch_targets, device):
         affines = []
 
         for v in range(V):
+
             # --- 修正部分开始 ---
             # DexYCB 返回的 extrinsics 已经是 World -> Camera 的 3x4 矩阵
             # 因此不需要求逆，直接切片提取 R 和 T

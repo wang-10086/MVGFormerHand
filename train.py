@@ -1,149 +1,255 @@
-# train_hand.py
+# train.py
 import ssl
 
-# 全局取消证书验证，防止 urllib 报错
 ssl._create_default_https_context = ssl._create_unverified_context
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import torch.optim as optim
 import os
+import sys
 import warnings
+import time
+import datetime
+import csv
+import logging
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter  # --- [新增] 导入 TensorBoard ---
+from torch.utils.tensorboard import SummaryWriter
 
-# 1. 导入配置和适配器
 from config_hand import _C as cfg
 from adapter import collate_dexycb_to_mvgformer
-
-# 2. 导入你的数据加载器
+# 引入两个数据集类
 from datasets.DexYCB import DEXYCBDatasets
-
-# 3. 导入 MVGFormer 模型
+from datasets.DriverHOI import DriverHOIDatasets
 from model import get_mvp
 
 
+class ExperimentManager:
+    def __init__(self, base_dir="checkpoints"):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 将数据集名称加入实验文件夹，方便区分
+        exp_name = f"{timestamp}_{cfg.DATASET.NAME}"
+        self.exp_dir = os.path.join(base_dir, exp_name)
+        os.makedirs(self.exp_dir, exist_ok=True)
+
+        self.writer = SummaryWriter(log_dir=os.path.join(self.exp_dir, "tb_logs"))
+        self.log_file = os.path.join(self.exp_dir, "output.out")
+        self.logger = self._setup_logger()
+
+        self.csv_file = os.path.join(self.exp_dir, "training_stats.csv")
+        self.csv_headers = ["Epoch", "Train_Loss", "Train_L1", "Train_Proj", "Val_MPJPE", "Time_Elapsed"]
+        with open(self.csv_file, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(self.csv_headers)
+
+        self.logger.info(f"Experiment started! Artifacts saved in: {self.exp_dir}")
+        self.logger.info(f"Current Dataset Config: {cfg.DATASET.NAME}")
+
+    def _setup_logger(self):
+        logger = logging.getLogger("Trainer")
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            fh = logging.FileHandler(self.log_file)
+            fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+            ch = logging.StreamHandler(sys.stdout)
+            ch.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+            logger.addHandler(fh)
+            logger.addHandler(ch)
+        return logger
+
+    def log(self, msg):
+        self.logger.info(msg)
+
+    def log_csv(self, row_data):
+        with open(self.csv_file, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row_data)
+
+    def save_checkpoint(self, model, epoch, metric, is_best=False):
+        state = {
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'mpjpe': metric,
+            'config': cfg,  # 保存配置以便复现
+        }
+        torch.save(state, os.path.join(self.exp_dir, "last_model.pth"))
+        if is_best:
+            torch.save(state, os.path.join(self.exp_dir, "best_model.pth"))
+            self.log(f"New Best Model! MPJPE: {metric:.2f} mm")
+
+
+def compute_mpjpe(pred_poses, gt_poses):
+    error = torch.norm(pred_poses - gt_poses, dim=-1)
+    return error.mean().item() * 1000.0
+
+
+def validate(model, dataloader, device):
+    model.eval()
+    total_mpjpe = 0.0
+    num_batches = 0
+
+    if hasattr(model, 'matcher'):
+        matcher = model.matcher
+    elif hasattr(model.module, 'matcher'):
+        matcher = model.module.matcher
+    else:
+        matcher = None
+
+    with torch.no_grad():
+        for batch_inputs, batch_targets, _ in tqdm(dataloader, desc="Validating", leave=False):
+            views, meta = collate_dexycb_to_mvgformer(batch_inputs, batch_targets, device)
+            outputs, _ = model(views, meta)
+
+            pred_all = outputs['pred_poses']['outputs_coord']
+            B = pred_all.shape[0]
+            pred_poses_reshaped = pred_all.view(B, cfg.DECODER.num_instance, 21, 3)
+            pred_logits = outputs['pred_logits']
+            pred_probs = pred_logits.view(B, cfg.DECODER.num_instance, 21, 1).mean(dim=2).sigmoid()
+            gt_poses = torch.stack([m['joints_3d'] for m in meta]).squeeze(1).to(device)
+
+            batch_error = 0.0
+            if matcher is not None:
+                indices = matcher(pred_probs, pred_poses_reshaped, gt_poses)
+                for b in range(B):
+                    src_idx, tgt_idx = indices[b]
+                    best_idx = src_idx.item()
+                    pred_pose = pred_poses_reshaped[b, best_idx]
+                    gt_pose = gt_poses[b]
+                    batch_error += compute_mpjpe(pred_pose, gt_pose)
+            else:
+                for b in range(B):
+                    gt_b = gt_poses[b]
+                    preds_b = pred_poses_reshaped[b]
+                    diff = preds_b - gt_b.unsqueeze(0)
+                    errors = torch.norm(diff, dim=-1).mean(dim=-1)
+                    min_error_m = errors.min().item()
+                    batch_error += (min_error_m * 1000.0)
+
+            total_mpjpe += (batch_error / B)
+            num_batches += 1
+
+    return total_mpjpe / num_batches if num_batches > 0 else 0.0
+
+
 def main():
-    # --- 忽略所有警告 ---
     warnings.filterwarnings("ignore")
 
-    # --- 设置 ---
+    exp_manager = ExperimentManager()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    exp_manager.log(f"Using device: {device}")
 
-    # 路径配置
-    DEXYCB_ROOT = '/home/wk/wk/wk/datasets/DexYCB'
+    # -----------------------------------------------------------
+    # [核心修改] 根据 config 动态加载数据集
+    # -----------------------------------------------------------
+    dataset_name = cfg.DATASET.NAME.lower()
+    exp_manager.log(f"Initializing Dataset: {dataset_name} ...")
 
-    # --- [新增] TensorBoard 设置 ---
-    # 日志将保存在 logs/tb_logs 目录下
-    log_dir = os.path.join("logs", "tb_logs")
-    writer = SummaryWriter(log_dir=log_dir)
-    print(f"TensorBoard logging to: {log_dir}")
+    if dataset_name == 'dexycb':
+        root_dir = cfg.DATASET.ROOT_DEXYCB
+        # split='train' 会加载 Subject前85% + 前4个视角
+        train_dataset = DEXYCBDatasets(root_dir=root_dir, split='train')
+        # split='test' 会加载 Subject后15% + 后4个视角
+        val_dataset = DEXYCBDatasets(root_dir=root_dir, split='test')
 
-    # --- 1. 初始化数据 ---
-    print("Initializing DexYCB Dataset...")
-    dataset = DEXYCBDatasets(root_dir=DEXYCB_ROOT, split='train')
+    elif dataset_name == 'driverhoi':
+        root_dir = cfg.DATASET.ROOT_DRIVERHOI
+        train_dataset = DriverHOIDatasets(root_dir=root_dir, split='train')
+        val_dataset = DriverHOIDatasets(root_dir=root_dir, split='test')
 
-    # num_workers=0 方便调试，如果要加速加载可以设为 4 或 8
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=0, drop_last=True)
+    else:
+        raise ValueError(f"Unknown dataset name in config: {dataset_name}")
 
-    # --- 2. 初始化 MVGFormer 模型 ---
-    print("Building MVGFormer Hand Model...")
+    exp_manager.log(f"Train samples: {len(train_dataset)}")
+    exp_manager.log(f"Val   samples: {len(val_dataset)}")
+
+    # -----------------------------------------------------------
+
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=0, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=0, drop_last=False)
+
+    exp_manager.log("Building Model...")
     model = get_mvp(cfg, is_train=True).to(device)
 
-    # --- 3. 优化器 ---
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
-    # --- 4. 训练循环 ---
-    print("Start Training...")
-    model.train()
-
+    exp_manager.log(">>> Start Training <<<")
+    best_mpjpe = float('inf')
     num_epochs = 100
-    for epoch in range(num_epochs):
-        # --- [修改] 初始化 Epoch 累计变量 ---
-        total_loss_epoch = 0.0
-        total_l1_epoch = 0.0  # 累计 L1 Loss
-        total_proj_epoch = 0.0  # 累计 Projection Loss
 
-        # 使用 tqdm 包装 dataloader
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", unit="batch")
+    for epoch in range(num_epochs):
+        start_time = time.time()
+        model.train()
+
+        total_loss = 0.0
+        total_l1 = 0.0
+        total_proj = 0.0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]", unit="batch")
 
         for i, (batch_inputs, batch_targets, _) in enumerate(pbar):
-            # A. 数据适配
             views, meta = collate_dexycb_to_mvgformer(batch_inputs, batch_targets, device)
-
-            # B. 前向传播
             out, loss_dict = model(views, meta)
 
-            # C. Loss 计算
             loss_total = torch.tensor(0.0).to(device)
-
-            # 提取具体的子 Loss (用于计算 total loss)
             l1_loss = loss_dict.get('loss_pose_perjoint', torch.tensor(0.0).to(device))
             proj_loss = loss_dict.get('loss_pose_perprojection_2d', torch.tensor(0.0).to(device))
             ce_loss = loss_dict.get('loss_ce', torch.tensor(0.0).to(device))
 
-            # 加权求和
             if 'loss_pose_perjoint' in loss_dict:
                 loss_total += l1_loss * cfg.DECODER.loss_pose_perjoint
-
             if 'loss_pose_perprojection_2d' in loss_dict:
                 loss_total += proj_loss * cfg.DECODER.loss_pose_perprojection_2d
-
             if 'loss_ce' in loss_dict:
                 loss_total += ce_loss * cfg.DECODER.loss_weight_loss_ce
 
-            # 辅助 Loss (Auxiliary Loss)
             for k, v in loss_dict.items():
-                if '_0' in k or '_1' in k or '_2' in k:
-                    base_key = k.rsplit('_', 1)[0]
-                    if base_key == 'loss_pose_perjoint':
+                if '_0' in k or '_1' in k:
+                    base = k.rsplit('_', 1)[0]
+                    if base == 'loss_pose_perjoint':
                         loss_total += v * cfg.DECODER.loss_pose_perjoint
-                    elif base_key == 'loss_pose_perprojection_2d':
+                    elif base == 'loss_pose_perprojection_2d':
                         loss_total += v * cfg.DECODER.loss_pose_perprojection_2d
 
-            # D. 反向传播
             optimizer.zero_grad()
             loss_total.backward()
-
-            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-
             optimizer.step()
 
-            # --- [修改] 累计 Loss ---
-            # 使用 .item() 获取 python float 数值，防止显存泄漏
-            total_loss_epoch += loss_total.item()
-            total_l1_epoch += l1_loss.item()  # 记录原始 L1 (未加权)
-            total_proj_epoch += proj_loss.item()  # 记录原始 Proj (未加权)
+            total_loss += loss_total.item()
+            total_l1 += l1_loss.item()
+            total_proj += proj_loss.item()
 
-            # 更新进度条
-            pbar.set_postfix({
-                "Total": f"{loss_total.item():.4f}",
-                "L1": f"{l1_loss.item():.4f}",
-                "Proj": f"{proj_loss.item():.4f}"
-            })
+            pbar.set_postfix({"L1": f"{l1_loss.item():.4f}", "Proj": f"{proj_loss.item():.2f}"})
 
-        # --- [新增] Epoch 结束处理与 TensorBoard 写入 ---
-        avg_total = total_loss_epoch / len(dataloader)
-        avg_l1 = total_l1_epoch / len(dataloader)
-        avg_proj = total_proj_epoch / len(dataloader)
+        avg_loss = total_loss / len(train_loader)
+        avg_l1 = total_l1 / len(train_loader)
+        avg_proj = total_proj / len(train_loader)
 
-        print(f"Epoch {epoch + 1} Finished. Avg Loss: {avg_total:.4f}")
+        val_mpjpe = validate(model, val_loader, device)
+        scheduler.step()
 
-        # 写入 TensorBoard (按 Epoch 记录)
-        writer.add_scalar('Train/Total_Loss', avg_total, epoch + 1)
-        writer.add_scalar('Train/L1_Loss', avg_l1, epoch + 1)
-        writer.add_scalar('Train/Proj_Loss', avg_proj, epoch + 1)
+        elapsed = time.time() - start_time
+        log_str = (f"Epoch {epoch + 1} | "
+                   f"Loss: {avg_loss:.4f} (L1: {avg_l1:.4f}, Proj: {avg_proj:.2f}) | "
+                   f"Val MPJPE: {val_mpjpe:.2f} mm | "
+                   f"Time: {elapsed:.0f}s")
+        exp_manager.log(log_str)
 
-        # 保存模型
-        if (epoch + 1) % 5 == 0:
-            save_path = f"mvgformer_hand_epoch_{epoch + 1}.pth"
-            torch.save(model.state_dict(), save_path)
-            print(f"Model saved to {save_path}")
+        exp_manager.writer.add_scalar('Train/Loss', avg_loss, epoch)
+        exp_manager.writer.add_scalar('Train/L1', avg_l1, epoch)
+        exp_manager.writer.add_scalar('Train/Proj', avg_proj, epoch)
+        exp_manager.writer.add_scalar('Val/MPJPE_mm', val_mpjpe, epoch)
+        exp_manager.log_csv([epoch + 1, avg_loss, avg_l1, avg_proj, val_mpjpe, elapsed])
 
-    # 关闭 writer
-    writer.close()
+        is_best = val_mpjpe < best_mpjpe
+        if is_best:
+            best_mpjpe = val_mpjpe
+        exp_manager.save_checkpoint(model, epoch + 1, val_mpjpe, is_best=is_best)
+
+    exp_manager.log("Training Finished.")
+    exp_manager.writer.close()
 
 
 if __name__ == "__main__":

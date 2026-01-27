@@ -22,7 +22,7 @@ from config import cfg
 class DEXYCBDatasets(Dataset):
     def __init__(self, root_dir, split='train'):
         """
-        初始化 DexYCB 数据集 (无归一化版本, 适配 256x256 输入)
+        初始化 DexYCB 数据集
         """
         super(DEXYCBDatasets, self).__init__()
         self.root_dir = root_dir
@@ -44,38 +44,50 @@ class DEXYCBDatasets(Dataset):
         ])
 
         self.samples = self._collect_samples()
-        print(f"Dataset initialized from: {root_dir}")
-        print(f"Split: {split}, Collected samples: {len(self.samples)}")
+        print(f"[{split.upper()}] DexYCB Dataset initialized")
+        print(f"  Root: {root_dir}")
+        print(f"  Samples: {len(self.samples)}")
+        # 打印一下当前的视角策略
+        if split == 'train':
+            print("  [View Strategy] Training Mode: Using First 4 Views (0,1,2,3)")
+        else:
+            print("  [View Strategy] Testing Mode: Using Last 4 Views (4,5,6,7)")
 
     def _collect_samples(self):
-        # -----------------------------------------------------------
-        # [控制配置] 硬编码调试参数
-        # 1. 限制加载的被试数量 (None 表示全部)
-        MAX_SUBJECTS = 2
-
-        # 2. [新增] 限制每个被试下的序列数量 (None 表示全部)
-        # 例如设置为 1，则每个被试只加载它的第 1 个视频序列
-        MAX_SEQUENCES_PER_SUBJECT = 20
+        MAX_SEQUENCES_PER_SUBJECT = 10
         # -----------------------------------------------------------
 
         samples = []
         global_idx = 0
 
-        # --- 1. 获取并限制被试 ---
-        subjects = sorted([
+        # --- 1. 获取所有被试 ---
+        all_subjects = sorted([
             d for d in os.listdir(self.root_dir)
             if os.path.isdir(os.path.join(self.root_dir, d)) and d != "calibration"
         ])
 
-        if MAX_SUBJECTS is not None and isinstance(MAX_SUBJECTS, int):
-            original_cnt = len(subjects)
-            subjects = subjects[:MAX_SUBJECTS]
-            print(f"!!! [Limit] Subjects restricted: {len(subjects)}/{original_cnt}")
+        # --- 2. [核心修改] 根据 split 划分被试 ---
+        # DexYCB 通常有 10 个 subjects (subject_0 .. subject_9)
+        # 按照 8:2 或 9:1 划分
+        total_subj = len(all_subjects)
+        if total_subj > 0:
+            split_idx = int(0.85 * total_subj)
+            if split_idx == total_subj and total_subj > 1:
+                split_idx = total_subj - 1
 
-        for subject_dir in subjects:
+            if self.data_split == 'train':
+                target_subjects = all_subjects[:split_idx]
+            else:
+                target_subjects = all_subjects[split_idx:]
+        else:
+            target_subjects = []
+
+        print(f"  Using Subjects ({len(target_subjects)}): {target_subjects}")
+
+        for subject_dir in target_subjects:
             subject_path = os.path.join(self.root_dir, subject_dir)
 
-            # --- 2. 获取并限制序列 ---
+            # --- 获取并限制序列 ---
             # 先过滤出所有有效的序列目录
             all_seqs = sorted([
                 d for d in os.listdir(subject_path)
@@ -139,9 +151,31 @@ class DEXYCBDatasets(Dataset):
         with open(extrinsic_path, 'r') as file:
             extrinsic_config = yaml.load(file, Loader=yaml.FullLoader)["extrinsics"]
 
-        view_dirs = sorted([d for d in os.listdir(seq_path) if os.path.isdir(os.path.join(seq_path, d))])
+        all_view_dirs = sorted([d for d in os.listdir(seq_path) if os.path.isdir(os.path.join(seq_path, d))])
 
-        for view_idx in view_dirs:
+        # if self.data_split == 'train':
+        #     target_view_dirs = all_view_dirs[:4]
+        # else:
+        #     # 如果是 test，取后 4 个
+        #     # 注意：要确保视角总数够 8 个，不够的话代码会取剩下的所有
+        #     target_view_dirs = all_view_dirs[4:]
+        #
+        #     # 兜底：万一数据有问题导致不足 4 个，就取全部，避免报错
+        #     if len(target_view_dirs) == 0:
+        #         target_view_dirs = all_view_dirs
+
+        if self.data_split == 'train':
+            # 训练：取偶数视角 [0, 2, 4, 6]
+            target_view_dirs = [all_view_dirs[i] for i in range(0, 8, 2)]
+        else:
+            # 测试：取奇数视角 [1, 3, 5, 7]
+            target_view_dirs = [all_view_dirs[i] for i in range(1, 8, 2)]
+
+            # 兜底
+            if len(target_view_dirs) == 0:
+                target_view_dirs = all_view_dirs
+
+        for view_idx in target_view_dirs:
             view_path = os.path.join(seq_path, view_idx)
             rgb_path = os.path.join(view_path, f'color_{sample_idx:06d}.jpg')
 
@@ -213,53 +247,204 @@ class DEXYCBDatasets(Dataset):
 
         return final_inputs, final_targets, meta_info
 
+    def print_gt_stats(self, sample_stride=50):
+        """
+        [工具函数] 统计 GT 3D 坐标分布，并在控制台打印建议的 SPACE_CENTER 和 SPACE_SIZE。
+
+        Args:
+            sample_stride (int): 采样步长。默认为 50，即每 50 个样本统计一次。
+                                 既能保证速度，又具有统计学意义。
+        """
+        import torch
+        print(f"\n>>> 正在扫描数据集以计算 GT 统计信息 (每 {sample_stride} 个样本采样一次)...")
+
+        all_x, all_y, all_z = [], [], []
+
+        # 遍历数据集索引
+        for i in range(0, len(self), sample_stride):
+            # 直接调用内部获取数据的逻辑
+            # 注意：这里我们调用 __getitem__，它通常返回 (img, target, ...)
+            data = self.__getitem__(i)
+
+            target = None
+
+            # --- 自动寻找包含坐标的字典 ---
+            if isinstance(data, dict):
+                target = data
+            elif isinstance(data, (list, tuple)):
+                # 如果返回的是 tuple，遍历寻找含有 'world_coord' 的字典
+                for item in data:
+                    if isinstance(item, dict) and 'world_coord' in item:
+                        target = item
+                        break
+
+            if target is None or 'world_coord' not in target:
+                continue
+
+            # 提取坐标
+            # world_coord 通常是 Tensor 或 Numpy
+            world_coord = target['world_coord']
+
+            # 转为 Tensor 并拍平
+            if not isinstance(world_coord, torch.Tensor):
+                coords = torch.from_numpy(world_coord).float()
+            else:
+                coords = world_coord.float()
+
+            coords = coords.view(-1, 3)  # (N_points, 3)
+
+            all_x.append(coords[:, 0])
+            all_y.append(coords[:, 1])
+            all_z.append(coords[:, 2])
+
+        if not all_x:
+            print("错误: 未找到任何有效的 world_coord 数据！")
+            return
+
+        # 拼接所有采样点
+        all_x = torch.cat(all_x)
+        all_y = torch.cat(all_y)
+        all_z = torch.cat(all_z)
+
+        # 计算统计量
+        min_x, max_x, mean_x = all_x.min().item(), all_x.max().item(), all_x.mean().item()
+        min_y, max_y, mean_y = all_y.min().item(), all_y.max().item(), all_y.mean().item()
+        min_z, max_z, mean_z = all_z.min().item(), all_z.max().item(), all_z.mean().item()
+
+        # 计算建议的配置
+        center = [mean_x, mean_y, mean_z]
+
+        # 计算跨度
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+        span_z = max_z - min_z
+
+        # 建议尺寸：最大跨度 * 1.2 (留 20% 余量)
+        size_val = max(span_x, span_y, span_z) * 1.2
+
+        print("=" * 50)
+        print(f" [数据集 GT 统计结果]")
+        print(f"  X 轴: 范围 [{min_x:.3f}, {max_x:.3f}], 均值 {mean_x:.3f}")
+        print(f"  Y 轴: 范围 [{min_y:.3f}, {max_y:.3f}], 均值 {mean_y:.3f}")
+        print(f"  Z 轴: 范围 [{min_z:.3f}, {max_z:.3f}], 均值 {mean_z:.3f}")
+        print("-" * 50)
+        print(f" [建议修改 Config.py]")
+        print(f"  SPACE_CENTER = [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
+        print(f"  SPACE_SIZE   = [{size_val:.4f}, {size_val:.4f}, {size_val:.4f}]")
+        print("=" * 50)
+
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
+    import cv2  # 如果没有 cv2，可以用 PIL 或 plt 代替
 
+    # 忽略警告，保持输出清爽
     warnings.filterwarnings("ignore", category=UserWarning)
 
+    # 1. 初始化数据集
+    # ------------------------------------------------------------------
     root_path = cfg.root_dir if hasattr(cfg, 'root_dir') else '/home/wk/wk/wk/datasets/DexYCB'
     print(f"Initializing dataset from: {root_path}")
     dataset = DEXYCBDatasets(root_dir=root_path, split='train')
 
     if len(dataset) > 0:
-        idx = min(800, len(dataset) - 1)
+        # 2. 随机取一个样本 (建议取稍微靠后一点的，避开可能的空数据)
+        idx = min(100, len(dataset) - 1)
         print(f"\nLoading sample index: {idx}")
+
+        # 获取由 Dataset __getitem__ 返回的数据
+        # inputs['img']: (V, 3, 256, 256)
+        # targets['world_coord']: (V, 21, 3)
+        # targets['extrinsic']: (V, 4, 4) 或 (V, 3, 4) -- 这里通常是 Camera Pose (C2W)
         inputs, targets, meta_info = dataset[idx]
 
+        # 选择第 0 个视角进行验证
         view_idx = 0
 
-        # --- 可视化 ---
-        img_vis = inputs['img'][view_idx].transpose(1, 2, 0)
-        uvd = targets['mesh_pose_uvd'][view_idx]
+        # ------------------------------------------------------------------
+        # 3. 提取核心数据
+        # ------------------------------------------------------------------
+        # 图像 (C, H, W) -> (H, W, C)
+        img_vis = inputs['img'][view_idx].transpose(1, 2, 0).copy()  # copy 用于画图
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        # 3D 世界坐标 (21, 3)
+        world_points = targets['world_coord'][view_idx]
+
+        # 相机内参 (3, 3)
+        K = targets['intrinsic'][view_idx]
+
+        # 相机外参 (通常是 Camera-to-World, 需验证)
+        extrinsic_c2w = targets['extrinsic'][view_idx]
+
+        # 数据集自带的 2D 标签 (作为 Ground Truth 参考)
+        gt_uv = targets['mesh_pose_uvd'][view_idx]
+
+        # ------------------------------------------------------------------
+        # 4. 核心验证：手动投影 (World -> Camera -> Image)
+        # ------------------------------------------------------------------
+        print(f"Extrinsic Shape: {extrinsic_c2w.shape}")
+
+        # [步骤 A] 处理外参：确保是 4x4 矩阵
+        if extrinsic_c2w.shape == (3, 4):
+            ext_4x4 = np.eye(4)
+            ext_4x4[:3, :] = extrinsic_c2w
+        else:
+            ext_4x4 = extrinsic_c2w
+
+        # # [步骤 B] 外参矩阵：本身就是World-to-Camera不需要求逆
+        w2c_matrix = ext_4x4
+
+        R_w2c = w2c_matrix[:3, :3]
+        T_w2c = w2c_matrix[:3, 3]
+
+        # [步骤 C] 坐标变换: World -> Camera
+        # P_cam = R * P_world + T
+        # world_points: (21, 3)
+        camera_points = np.dot(world_points, R_w2c.T) + T_w2c
+
+        # [步骤 D] 透视投影: Camera -> Pixel
+        # u = fx * x / z + cx
+        # v = fy * y / z + cy
+        # 或者 P_pixel = K @ P_cam
+        # (21, 3) @ (3, 3).T -> (21, 3)
+        pixel_coords_homo = np.dot(camera_points, K.T)
+
+        # 归一化 (除以 Z)
+        projected_uv = pixel_coords_homo[:, :2] / pixel_coords_homo[:, 2:3]
+
+        # ------------------------------------------------------------------
+        # 5. 可视化对比
+        # ------------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(10, 10))
+
+        # 显示图片
+        # 如果 Dataset 里做了 ImageNet Normalize，这里图片可能会很黑/奇怪，但不影响点的位置
         ax.imshow(img_vis)
 
-        x = uvd[:, 0]
-        y = uvd[:, 1]
-        ax.scatter(x, y, c='r', s=20, label='Joints')
+        # A. 画数据集自带的 GT 2D 点 (红色空心圆)
+        ax.scatter(gt_uv[:, 0], gt_uv[:, 1], s=80, edgecolors='red', facecolors='none', linewidths=2,
+                   label='Dataset GT (uvd)')
 
+        # B. 画我们要验证的 手动投影点 (绿色实心点)
+        ax.scatter(projected_uv[:, 0], projected_uv[:, 1], s=20, c='green', label='Manual Proj (World->Cam->Img)')
+
+        # 连线 (骨架) 方便观察
         bones = [
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            (0, 5), (5, 6), (6, 7), (7, 8),
-            (0, 9), (9, 10), (10, 11), (11, 12),
-            (0, 13), (13, 14), (14, 15), (15, 16),
+            (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+            (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
             (0, 17), (17, 18), (18, 19), (19, 20)
         ]
 
+        # 画绿色的骨架 (手动投影)
+        x_proj, y_proj = projected_uv[:, 0], projected_uv[:, 1]
         for start, end in bones:
-            if start < len(x) and end < len(x):
-                ax.plot([x[start], x[end]], [y[start], y[end]], 'b-', linewidth=1.5)
+            ax.plot([x_proj[start], x_proj[end]], [y_proj[start], y_proj[end]], 'g-', linewidth=1, alpha=0.7)
 
-        ax.set_title(f"View {view_idx} (256x256 Direct Vis)")
+        ax.legend()
+        ax.set_title(f"Projection Verification (View {view_idx})\nRed Circle: GT, Green Dot: Your Calculation")
         ax.axis('off')
-        plt.show()
 
-        print(f"Image Shape: {img_vis.shape}")
-        print("Visualizing World Coordinates...")
-        visualize_3d_joints(targets['world_coord'][view_idx])
+        plt.show()
 
     else:
         print("Dataset is empty.")

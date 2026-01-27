@@ -414,7 +414,10 @@ class MVGFormerHand(nn.Module):
         # 这里使用 Learnable Linear Layer 从 Query 生成初始位置
         self.ref_point_head = nn.Linear(cfg.DECODER.d_model, 3)
 
-        self.matcher = HungarianMatcher(cost_class=2.0, cost_pose=5.0)
+        self.matcher = HungarianMatcher(
+            cost_class=cfg.DECODER.cost_class,
+            cost_pose=cfg.DECODER.cost_pose
+        )
 
     def forward(self, views, meta):
         """
@@ -526,57 +529,72 @@ class MVGFormerHand(nn.Module):
             # --- Loss A: 3D L1 Loss ---
             loss_dict['loss_pose_perjoint'] = F.l1_loss(selected_pred, gt_poses)
 
-            # --- Loss B: 2D Projection Loss (带安全锁) ---
+            # -----------------------------------------------------------------
+            # --- Loss B: 2D Projection Loss (带可见性掩码 Visibility Mask) ---
+            # -----------------------------------------------------------------
+
             # 1. 提取相机参数
             Ks = cameras_stacked['camera_Intri']  # (B, V, 3, 3)
-            Rs = cameras_stacked['camera_R']
-            Ts = cameras_stacked['camera_T']
+            Rs = cameras_stacked['camera_R']  # (B, V, 3, 3)
+            Ts = cameras_stacked['camera_T']  # (B, V, 3)
             H, W = img_size
 
-            # 2. 预测点 World -> Camera
-            # (B, 21, 3) -> (B, V, 21, 3)
+            # 2. [预测点] World -> Camera
+            # 公式: P_cam = P_world @ R^T + T (符合 Adapter 的 W2C 定义)
             pred_3d_exp = selected_pred.unsqueeze(1).expand(-1, V, -1, -1)
             pred_cam = torch.matmul(pred_3d_exp, Rs.transpose(-1, -2)) + Ts.unsqueeze(2)
 
-            # 3. 深度安全锁 (Z-Clamp)
-            pred_z = pred_cam[..., 2].clamp(min=0.1)  # 最小 10cm，防止除零
-            pred_x = pred_cam[..., 0]
-            pred_y = pred_cam[..., 1]
+            # 3. [预测点] 投影计算
+            pred_z = pred_cam[..., 2].clamp(min=0.01)  # 防止除零
+            # 注意: fx, fy, cx, cy 需要 unsqueeze 匹配 (B, V, 21)
+            pred_u = pred_cam[..., 0] * Ks[..., 0, 0].unsqueeze(2) / pred_z + Ks[..., 0, 2].unsqueeze(2)
+            pred_v = pred_cam[..., 1] * Ks[..., 1, 1].unsqueeze(2) / pred_z + Ks[..., 1, 2].unsqueeze(2)
 
-            # 4. 投影计算
-            fx = Ks[..., 0, 0].unsqueeze(2)
-            fy = Ks[..., 1, 1].unsqueeze(2)
-            cx = Ks[..., 0, 2].unsqueeze(2)
-            cy = Ks[..., 1, 2].unsqueeze(2)
-
-            pred_u = pred_x * fx / pred_z + cx
-            pred_v = pred_y * fy / pred_z + cy
-
-            # 5. 坐标截断 (Pixel-Clamp) 防止梯度爆炸
+            # 4. [预测点] 坐标截断 (防止梯度爆炸)
+            # 即使有 Mask，预测点飞太远也会导致数值不稳定，稍微限制一下范围是好的
             pred_u = pred_u.clamp(min=-W, max=2 * W)
             pred_v = pred_v.clamp(min=-H, max=2 * H)
             pred_uv = torch.stack([pred_u, pred_v], dim=-1)
 
-            # 6. 生成 GT 的 2D 投影 (作为 Target)
+            # 5. [GT真值] 生成 Target 并计算 Mask
             # 重新投影 GT 3D -> 2D
-            gt_3d_exp = gt_poses.unsqueeze(1).expand(-1, V, -1, -1)  # (B, V, 21, 3)
+            gt_3d_exp = gt_poses.unsqueeze(1).expand(-1, V, -1, -1)
             gt_cam = torch.matmul(gt_3d_exp, Rs.transpose(-1, -2)) + Ts.unsqueeze(2)
-            # 深度保护
-            gt_z = gt_cam[..., 2].clamp(min=0.01)
-            # [修改点] 直接使用 fx, cx (形状 B,V,1)，不要 squeeze
-            # gt_cam[..., 0] 是 (B, V, 21)
-            # fx 是 (B, V, 1)
-            # 结果是 (B, V, 21) -> 符合广播规则
-            gt_u_target = gt_cam[..., 0] * fx / gt_z + cx
-            gt_v_target = gt_cam[..., 1] * fy / gt_z + cy
+
+            # --- [核心逻辑: 制作 Mask] ---
+
+            # (A) 深度 Mask: 必须在相机前方 (Z > 0.05m)
+            # 很多视角手被挡住或在背面，Z值可能是负数，必须过滤！
+            mask_z = gt_cam[..., 2] > 0.05
+
+            # (B) 范围 Mask: 投影必须在图像内
+            gt_z_safe = gt_cam[..., 2].clamp(min=0.01)
+            gt_u_target = gt_cam[..., 0] * Ks[..., 0, 0].unsqueeze(2) / gt_z_safe + Ks[..., 0, 2].unsqueeze(2)
+            gt_v_target = gt_cam[..., 1] * Ks[..., 1, 1].unsqueeze(2) / gt_z_safe + Ks[..., 1, 2].unsqueeze(2)
+
+            mask_box = (gt_u_target >= 0) & (gt_u_target < W) & \
+                       (gt_v_target >= 0) & (gt_v_target < H)
+
+            # (C) 组合 Mask
+            # (B, V, 21) -> (B, V, 21, 1) 用于广播
+            valid_mask = (mask_z & mask_box).unsqueeze(-1).float()
+
+            # 6. 计算 Masked Loss
             gt_uv = torch.stack([gt_u_target, gt_v_target], dim=-1)
 
-            # 计算 2D Loss
-            loss_dict['loss_pose_perprojection_2d'] = F.l1_loss(pred_uv, gt_uv)
+            # 关键点: reduction='none' 保留每个点的 loss
+            raw_l1_loss = F.l1_loss(pred_uv, gt_uv, reduction='none')
+
+            # 只累加有效点的 Loss (无效点 * 0)
+            masked_loss = raw_l1_loss * valid_mask
+
+            # 归一化: 除以有效点的数量 (防止除以 0)
+            num_valid = valid_mask.sum() + 1e-6
+            loss_dict['loss_pose_perprojection_2d'] = masked_loss.sum() / num_valid
+
+            # -----------------------------------------------------------------
 
             # --- Loss C: Classification Loss ---
-            # pred_logits_inst.squeeze(-1) shape: (B, N_inst)
-            # target_classes shape: (B, N_inst)
             loss_dict['loss_ce'] = F.binary_cross_entropy_with_logits(
                 pred_logits_inst.squeeze(-1),
                 target_classes
