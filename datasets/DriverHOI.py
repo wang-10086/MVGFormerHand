@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from PIL import Image
 import cv2
+import random
 
 
 class DriverHOIDatasets(Dataset):
@@ -19,58 +20,82 @@ class DriverHOIDatasets(Dataset):
     def __init__(self,
                  root_dir: str,
                  split: str = 'train',  # 'train' or 'test'
+                 split_strategy: str = 'subject',  # [新增] 'subject' or 'random'
                  camera_views: Optional[List[str]] = None,
                  target_size: Tuple[int, int] = (256, 256),
                  **kwargs):
 
         self.data_root = Path(root_dir)
         self.split = split
+        self.split_strategy = split_strategy
         self.target_size = target_size
 
         # 默认四视角
         self.available_views = ['MBP25030012', 'MBP25030014', 'MBP25030016', 'MBP25030017']
         self.camera_views = camera_views if camera_views is not None else self.available_views
 
-        # 图像预处理
+        # 预处理
         self.transform = transforms.Compose([
             transforms.Resize(self.target_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-        # 加载相机参数
         self.camera_intrinsics, self.camera_extrinsics = self._load_calibration_files(self.data_root / "calibration")
 
         # 1. 获取所有 Subject
         all_subjects = sorted(
             [d.name for d in self.data_root.iterdir() if d.is_dir() and d.name.startswith("subject")])
 
-        # 2. [核心修改] 根据 split 参数划分 Subject
-        # 确定性划分：按名称排序，前 ~85% 为训练集，后 ~15% 为测试集
-        # 例如 10 个 subject: train=[0..8], test=[9]
-        total_subj = len(all_subjects)
-        if total_subj > 0:
-            split_idx = int(0.85 * total_subj)
-            # 确保至少留一个给测试集 (如果总数大于1)
-            if split_idx == total_subj and total_subj > 1:
-                split_idx = total_subj - 1
+        # ---------------------------------------------------------------------
+        # [核心修改] 数据划分逻辑
+        # ---------------------------------------------------------------------
+        if self.split_strategy == 'subject':
+            # --- 策略 A: 按被试划分 (Subject Split) ---
+            # 逻辑: 训练集只看前 85% 的人，测试集看后 15% 的人
+            total_subj = len(all_subjects)
+            if total_subj > 0:
+                split_idx = int(0.85 * total_subj)
+                if split_idx == total_subj and total_subj > 1: split_idx = total_subj - 1
+
+                if self.split == 'train':
+                    self.subjects = all_subjects[:split_idx]
+                else:
+                    self.subjects = all_subjects[split_idx:]
+            else:
+                self.subjects = []
+
+            # 构建索引 (只包含选定 Subject 的数据)
+            self.data_index = self._build_data_index()
+
+        elif self.split_strategy == 'random':
+            # --- 策略 B: 按比例随机划分 (Random Ratio Split) ---
+            # 逻辑: 使用所有被试的数据，混合在一起，切分 90% / 10%
+            self.subjects = all_subjects  # 使用所有人
+            full_index = self._build_data_index()  # 获取所有帧
+
+            # [关键] 使用固定的随机种子打乱，确保 Train 和 Test 互斥且互补
+            # 无论实例化多少次，shuffle 结果一致
+            rnd = random.Random(42)
+            rnd.shuffle(full_index)
+
+            split_point = int(0.9 * len(full_index))
 
             if self.split == 'train':
-                self.subjects = all_subjects[:split_idx]
+                self.data_index = full_index[:split_point]
             else:
-                self.subjects = all_subjects[split_idx:]
+                self.data_index = full_index[split_point:]
+
         else:
-            self.subjects = []
+            raise ValueError(f"Unknown split strategy: {self.split_strategy}")
 
-        # 3. 构建索引
-        self.data_index = self._build_data_index()
+        # ---------------------------------------------------------------------
 
-        # 定义需要用右手的 Device ID 集合
         self.right_hand_devices = set(range(1, 18)) | set(range(26, 30))
 
         print(f"[{self.split.upper()}] DriverHOI Dataset Initialized")
-        print(f"  Root: {self.data_root}")
-        print(f"  Subjects ({len(self.subjects)}): {self.subjects}")
+        print(f"  Strategy: {self.split_strategy}")
+        print(f"  Subjects Pool: {len(self.subjects)}")
         print(f"  Total Frames: {len(self.data_index)}")
 
     def _load_calibration_files(self, calib_dir: Path):

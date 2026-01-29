@@ -3,6 +3,9 @@ from yacs.config import CfgNode as CN
 
 _C = CN()
 
+_C.MODEL = CN()
+_C.MODEL.NAME = 'lat'  # 可选: 'mvgformer', 'lat', 'lvt', 'cvf', 'epitrans'
+
 # -----------------------------------------------------------------------------
 # 1. 数据集配置 (核心修改)
 # -----------------------------------------------------------------------------
@@ -10,12 +13,16 @@ _C.DATASET = CN()
 _C.DATASET.NAME = 'dexycb'  # 可选: 'dexycb' 或 'driverhoi'
 # _C.DATASET.NAME = 'driverhoi'
 
+# 'subject': 按被试划分 (Train: Subject 0-8, Test: Subject 9) -> 验证泛化性
+# 'random':  按比例随机划分 (Train: 90%所有数据, Test: 10%所有数据) -> 验证拟合能力/扩大训练数据
+_C.DATASET.SPLIT_STRATEGY = 'random'
+
 # 数据集路径配置
 _C.DATASET.ROOT_DEXYCB = '/home/wk/wk/wk/datasets/DexYCB'
 _C.DATASET.ROOT_DRIVERHOI = '/home/wk/wk/wk/datasets/DriverHOI3D'
 
 # 相机视角数
-_C.DATASET.CAMERA_NUM = 4
+_C.DATASET.CAMERA_NUM = 8
 
 # -----------------------------------------------------------------------------
 # 2. 空间与几何 (Hand-Specific)
@@ -35,7 +42,7 @@ _C.DECODER.nhead = 8
 _C.DECODER.dim_feedforward = 1024
 _C.DECODER.dropout = 0.1
 _C.DECODER.num_decoder_layers = 4   # 迭代层数
-_C.DECODER.num_instance = 1         # Query 数量 (单手设为1)
+_C.DECODER.num_instance = 100         # Query 数量 (单手设为1)
 _C.DECODER.num_keypoints = 21       # 21 个关节 Query
 # 使用 ResNet 的哪些层特征 (0=Layer2, 1=Layer3, 2=Layer4)
 _C.DECODER.use_feat_level = [0, 1, 2]

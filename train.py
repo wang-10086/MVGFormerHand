@@ -143,19 +143,18 @@ def main():
     # [核心修改] 根据 config 动态加载数据集
     # -----------------------------------------------------------
     dataset_name = cfg.DATASET.NAME.lower()
+    split_strategy = cfg.DATASET.SPLIT_STRATEGY  # 获取策略
     exp_manager.log(f"Initializing Dataset: {dataset_name} ...")
 
     if dataset_name == 'dexycb':
         root_dir = cfg.DATASET.ROOT_DEXYCB
-        # split='train' 会加载 Subject前85% + 前4个视角
-        train_dataset = DEXYCBDatasets(root_dir=root_dir, split='train')
-        # split='test' 会加载 Subject后15% + 后4个视角
-        val_dataset = DEXYCBDatasets(root_dir=root_dir, split='test')
+        train_dataset = DEXYCBDatasets(root_dir=root_dir, split='train', split_strategy=split_strategy)
+        val_dataset = DEXYCBDatasets(root_dir=root_dir, split='test', split_strategy=split_strategy)
 
     elif dataset_name == 'driverhoi':
         root_dir = cfg.DATASET.ROOT_DRIVERHOI
-        train_dataset = DriverHOIDatasets(root_dir=root_dir, split='train')
-        val_dataset = DriverHOIDatasets(root_dir=root_dir, split='test')
+        train_dataset = DriverHOIDatasets(root_dir=root_dir, split='train', split_strategy=split_strategy)
+        val_dataset = DriverHOIDatasets(root_dir=root_dir, split='test', split_strategy=split_strategy)
 
     else:
         raise ValueError(f"Unknown dataset name in config: {dataset_name}")

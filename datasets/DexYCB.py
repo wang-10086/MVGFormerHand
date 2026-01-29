@@ -7,6 +7,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as standard
+import random
 
 # 本地模块引用
 from datasets.datasets_utils import (
@@ -20,113 +21,107 @@ from config import cfg
 
 
 class DEXYCBDatasets(Dataset):
-    def __init__(self, root_dir, split='train'):
-        """
-        初始化 DexYCB 数据集
-        """
+    def __init__(self, root_dir, split='train', split_strategy='subject'):
         super(DEXYCBDatasets, self).__init__()
         self.root_dir = root_dir
         self.calibration_dir = os.path.join(root_dir, 'calibration/calibration')
         self.data_split = split
+        self.split_strategy = split_strategy
 
-        # 定义标准 ImageNet 归一化参数
-        self.normalize = standard.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-
-        # 仅保留 Resize 和 ToTensor，移除 Normalize
-        # 这样 img 数据范围是 [0, 1]，方便直接可视化
+        # ... transforms ...
         self.transform = standard.Compose([
-            standard.Resize(cfg.input_img_shape),
+            standard.Resize(cfg.NETWORK.IMAGE_SIZE if hasattr(cfg, 'NETWORK') else (256, 256)),
             standard.ToTensor(),
-            self.normalize,
+            standard.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
+        # 收集样本
         self.samples = self._collect_samples()
+
         print(f"[{split.upper()}] DexYCB Dataset initialized")
-        print(f"  Root: {root_dir}")
+        print(f"  Strategy: {self.split_strategy}")
         print(f"  Samples: {len(self.samples)}")
-        # 打印一下当前的视角策略
-        if split == 'train':
-            print("  [View Strategy] Training Mode: Using First 4 Views (0,1,2,3)")
-        else:
-            print("  [View Strategy] Testing Mode: Using Last 4 Views (4,5,6,7)")
 
     def _collect_samples(self):
-        MAX_SEQUENCES_PER_SUBJECT = 10
-        # -----------------------------------------------------------
-
-        samples = []
-        global_idx = 0
-
-        # --- 1. 获取所有被试 ---
+        # 1. 获取所有 Subject
         all_subjects = sorted([
             d for d in os.listdir(self.root_dir)
             if os.path.isdir(os.path.join(self.root_dir, d)) and d != "calibration"
         ])
 
-        # --- 2. [核心修改] 根据 split 划分被试 ---
-        # DexYCB 通常有 10 个 subjects (subject_0 .. subject_9)
-        # 按照 8:2 或 9:1 划分
-        total_subj = len(all_subjects)
-        if total_subj > 0:
-            split_idx = int(0.85 * total_subj)
-            if split_idx == total_subj and total_subj > 1:
-                split_idx = total_subj - 1
+        # ---------------------------------------------------------------------
+        # [核心修改] 划分逻辑
+        # ---------------------------------------------------------------------
+        target_subjects = []
 
+        if self.split_strategy == 'subject':
+            # --- 策略 A: 按被试划分 ---
+            total_subj = len(all_subjects)
+            if total_subj > 0:
+                split_idx = int(0.85 * total_subj)
+                if split_idx == total_subj and total_subj > 1: split_idx = total_subj - 1
+                if self.data_split == 'train':
+                    target_subjects = all_subjects[:split_idx]
+                else:
+                    target_subjects = all_subjects[split_idx:]
+
+            # 收集这些被试的所有样本
+            final_samples = self._scan_subjects(target_subjects)
+
+        elif self.split_strategy == 'random':
+            # --- 策略 B: 随机混合划分 ---
+            # 1. 先收集所有人的所有样本
+            all_samples = self._scan_subjects(all_subjects)
+
+            # 2. 固定随机打乱
+            rnd = random.Random(42)
+            rnd.shuffle(all_samples)
+
+            # 3. 切分
+            split_point = int(0.9 * len(all_samples))
             if self.data_split == 'train':
-                target_subjects = all_subjects[:split_idx]
+                final_samples = all_samples[:split_point]
             else:
-                target_subjects = all_subjects[split_idx:]
+                final_samples = all_samples[split_point:]
+
         else:
-            target_subjects = []
+            raise ValueError(f"Unknown split strategy: {self.split_strategy}")
 
-        print(f"  Using Subjects ({len(target_subjects)}): {target_subjects}")
+        # 重建索引 idx
+        for i, s in enumerate(final_samples):
+            s['idx'] = i
 
-        for subject_dir in target_subjects:
+        return final_samples
+
+    def _scan_subjects(self, subject_list):
+        """辅助函数：扫描指定 Subject 列表下的所有样本"""
+        samples = []
+        global_idx = 0  # 临时 ID
+        MAX_SEQ = None
+
+        for subject_dir in subject_list:
             subject_path = os.path.join(self.root_dir, subject_dir)
+            all_seqs = sorted([d for d in os.listdir(subject_path) if os.path.isdir(os.path.join(subject_path, d))])
+            if MAX_SEQ: all_seqs = all_seqs[:MAX_SEQ]
 
-            # --- 获取并限制序列 ---
-            # 先过滤出所有有效的序列目录
-            all_seqs = sorted([
-                d for d in os.listdir(subject_path)
-                if os.path.isdir(os.path.join(subject_path, d))
-            ])
-
-            # 应用序列数量限制
-            if MAX_SEQUENCES_PER_SUBJECT is not None and isinstance(MAX_SEQUENCES_PER_SUBJECT, int):
-                target_seqs = all_seqs[:MAX_SEQUENCES_PER_SUBJECT]
-            else:
-                target_seqs = all_seqs
-
-            # print(f"  - Subject {subject_dir}: Loading {len(target_seqs)} sequences")
-
-            for seq_dir in target_seqs:
+            for seq_dir in all_seqs:
                 seq_path = os.path.join(subject_path, seq_dir)
-
-                # 计算该序列下的帧数 (通过任意一个视角文件夹判断)
                 count = 0
-                # 遍历所有视角文件夹找到一个存在的来计算帧数
+                # 寻找任一有效视角计算帧数
                 possible_views = sorted(os.listdir(seq_path))
-                for view_dir in possible_views:
-                    view_path = os.path.join(seq_path, view_dir)
-                    if os.path.isdir(view_path):
-                        # 简单统计 jpg 数量
-                        count = sum(1 for f in os.listdir(view_path) if f.endswith('.jpg'))
-                        if count > 0:
-                            break
+                for v in possible_views:
+                    vp = os.path.join(seq_path, v)
+                    if os.path.isdir(vp):
+                        count = sum(1 for f in os.listdir(vp) if f.endswith('.jpg'))
+                        if count > 0: break
 
-                # 添加样本
                 for sample in range(count):
                     samples.append({
                         "subject": subject_dir,
                         "seq": seq_dir,
                         "sample": sample,
-                        "idx": global_idx
+                        "idx": 0  # 稍后重置
                     })
-                    global_idx += 1
-
         return samples
 
     def __len__(self):
@@ -164,16 +159,18 @@ class DEXYCBDatasets(Dataset):
         #     if len(target_view_dirs) == 0:
         #         target_view_dirs = all_view_dirs
 
-        if self.data_split == 'train':
-            # 训练：取偶数视角 [0, 2, 4, 6]
-            target_view_dirs = [all_view_dirs[i] for i in range(0, 8, 2)]
-        else:
-            # 测试：取奇数视角 [1, 3, 5, 7]
-            target_view_dirs = [all_view_dirs[i] for i in range(1, 8, 2)]
+        # if self.data_split == 'train':
+        #     # 训练：取偶数视角 [0, 2, 4, 6]
+        #     target_view_dirs = [all_view_dirs[i] for i in range(0, 8, 2)]
+        # else:
+        #     # 测试：取奇数视角 [1, 3, 5, 7]
+        #     target_view_dirs = [all_view_dirs[i] for i in range(1, 8, 2)]
+        #
+        #     # 兜底
+        #     if len(target_view_dirs) == 0:
+        #         target_view_dirs = all_view_dirs
 
-            # 兜底
-            if len(target_view_dirs) == 0:
-                target_view_dirs = all_view_dirs
+        target_view_dirs = all_view_dirs
 
         for view_idx in target_view_dirs:
             view_path = os.path.join(seq_path, view_idx)

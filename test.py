@@ -75,16 +75,16 @@ def test(args):
     os.makedirs(save_dir, exist_ok=True)
 
     dataset_name = cfg.DATASET.NAME.lower()
+    split_strategy = cfg.DATASET.SPLIT_STRATEGY
     print(f"Initializing Test Dataset: {dataset_name} ...")
 
     if dataset_name == 'dexycb':
         root_dir = cfg.DATASET.ROOT_DEXYCB
-        # 测试模式：加载未见过的 Subject + 未见过的后4个视角
-        test_dataset = DEXYCBDatasets(root_dir=root_dir, split='test')
+        test_dataset = DEXYCBDatasets(root_dir=root_dir, split='test', split_strategy=split_strategy)
 
     elif dataset_name == 'driverhoi':
         root_dir = cfg.DATASET.ROOT_DRIVERHOI
-        test_dataset = DriverHOIDatasets(root_dir=root_dir, split='test')
+        test_dataset = DriverHOIDatasets(root_dir=root_dir, split='test', split_strategy=split_strategy)
 
     else:
         raise ValueError(f"Unknown dataset name: {dataset_name}")
