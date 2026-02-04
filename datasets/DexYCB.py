@@ -28,9 +28,11 @@ class DEXYCBDatasets(Dataset):
         self.data_split = split
         self.split_strategy = split_strategy
 
+        target_size = tuple(cfg.NETWORK.IMAGE_SIZE)
+
         # ... transforms ...
         self.transform = standard.Compose([
-            standard.Resize(cfg.NETWORK.IMAGE_SIZE if hasattr(cfg, 'NETWORK') else (256, 256)),
+            standard.Resize(target_size),
             standard.ToTensor(),
             standard.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
@@ -97,7 +99,7 @@ class DEXYCBDatasets(Dataset):
         """辅助函数：扫描指定 Subject 列表下的所有样本"""
         samples = []
         global_idx = 0  # 临时 ID
-        MAX_SEQ = None
+        MAX_SEQ = 10
 
         for subject_dir in subject_list:
             subject_path = os.path.join(self.root_dir, subject_dir)
@@ -147,30 +149,9 @@ class DEXYCBDatasets(Dataset):
             extrinsic_config = yaml.load(file, Loader=yaml.FullLoader)["extrinsics"]
 
         all_view_dirs = sorted([d for d in os.listdir(seq_path) if os.path.isdir(os.path.join(seq_path, d))])
-
-        # if self.data_split == 'train':
-        #     target_view_dirs = all_view_dirs[:4]
-        # else:
-        #     # 如果是 test，取后 4 个
-        #     # 注意：要确保视角总数够 8 个，不够的话代码会取剩下的所有
-        #     target_view_dirs = all_view_dirs[4:]
-        #
-        #     # 兜底：万一数据有问题导致不足 4 个，就取全部，避免报错
-        #     if len(target_view_dirs) == 0:
-        #         target_view_dirs = all_view_dirs
-
-        # if self.data_split == 'train':
-        #     # 训练：取偶数视角 [0, 2, 4, 6]
-        #     target_view_dirs = [all_view_dirs[i] for i in range(0, 8, 2)]
-        # else:
-        #     # 测试：取奇数视角 [1, 3, 5, 7]
-        #     target_view_dirs = [all_view_dirs[i] for i in range(1, 8, 2)]
-        #
-        #     # 兜底
-        #     if len(target_view_dirs) == 0:
-        #         target_view_dirs = all_view_dirs
-
         target_view_dirs = all_view_dirs
+
+        target_w, target_h = cfg.NETWORK.IMAGE_SIZE
 
         for view_idx in target_view_dirs:
             view_path = os.path.join(seq_path, view_idx)
@@ -188,8 +169,8 @@ class DEXYCBDatasets(Dataset):
             img_np = np.array(img_tensor)
 
             # 计算缩放因子
-            scale_x = cfg.input_img_shape[0] / orig_width
-            scale_y = cfg.input_img_shape[1] / orig_height
+            scale_x = target_w / orig_width
+            scale_y = target_h / orig_height
 
             # --- 2. 参数读取 ---
             intrinsic_path = os.path.join(self.calibration_dir, f'intrinsics/{view_idx}_640x480.yml')
@@ -232,6 +213,7 @@ class DEXYCBDatasets(Dataset):
             meta_info['seq'].append(sample_info["seq"])
             meta_info['sample_idx'].append(sample_idx)
             meta_info['view_idx'].append(view_idx)
+            meta_info['img_paths'].append(rgb_path)
 
         final_inputs = {k: np.stack(v, axis=0) for k, v in inputs.items()}
         final_targets = {}
@@ -260,7 +242,6 @@ class DEXYCBDatasets(Dataset):
         # 遍历数据集索引
         for i in range(0, len(self), sample_stride):
             # 直接调用内部获取数据的逻辑
-            # 注意：这里我们调用 __getitem__，它通常返回 (img, target, ...)
             data = self.__getitem__(i)
 
             target = None
@@ -279,7 +260,6 @@ class DEXYCBDatasets(Dataset):
                 continue
 
             # 提取坐标
-            # world_coord 通常是 Tensor 或 Numpy
             world_coord = target['world_coord']
 
             # 转为 Tensor 并拍平
@@ -349,10 +329,6 @@ if __name__ == "__main__":
         idx = min(100, len(dataset) - 1)
         print(f"\nLoading sample index: {idx}")
 
-        # 获取由 Dataset __getitem__ 返回的数据
-        # inputs['img']: (V, 3, 256, 256)
-        # targets['world_coord']: (V, 21, 3)
-        # targets['extrinsic']: (V, 4, 4) 或 (V, 3, 4) -- 这里通常是 Camera Pose (C2W)
         inputs, targets, meta_info = dataset[idx]
 
         # 选择第 0 个视角进行验证
@@ -381,29 +357,18 @@ if __name__ == "__main__":
         # ------------------------------------------------------------------
         print(f"Extrinsic Shape: {extrinsic_c2w.shape}")
 
-        # [步骤 A] 处理外参：确保是 4x4 矩阵
         if extrinsic_c2w.shape == (3, 4):
             ext_4x4 = np.eye(4)
             ext_4x4[:3, :] = extrinsic_c2w
         else:
             ext_4x4 = extrinsic_c2w
 
-        # # [步骤 B] 外参矩阵：本身就是World-to-Camera不需要求逆
         w2c_matrix = ext_4x4
 
         R_w2c = w2c_matrix[:3, :3]
         T_w2c = w2c_matrix[:3, 3]
 
-        # [步骤 C] 坐标变换: World -> Camera
-        # P_cam = R * P_world + T
-        # world_points: (21, 3)
         camera_points = np.dot(world_points, R_w2c.T) + T_w2c
-
-        # [步骤 D] 透视投影: Camera -> Pixel
-        # u = fx * x / z + cx
-        # v = fy * y / z + cy
-        # 或者 P_pixel = K @ P_cam
-        # (21, 3) @ (3, 3).T -> (21, 3)
         pixel_coords_homo = np.dot(camera_points, K.T)
 
         # 归一化 (除以 Z)
@@ -414,25 +379,19 @@ if __name__ == "__main__":
         # ------------------------------------------------------------------
         fig, ax = plt.subplots(figsize=(10, 10))
 
-        # 显示图片
-        # 如果 Dataset 里做了 ImageNet Normalize，这里图片可能会很黑/奇怪，但不影响点的位置
         ax.imshow(img_vis)
 
-        # A. 画数据集自带的 GT 2D 点 (红色空心圆)
         ax.scatter(gt_uv[:, 0], gt_uv[:, 1], s=80, edgecolors='red', facecolors='none', linewidths=2,
                    label='Dataset GT (uvd)')
 
-        # B. 画我们要验证的 手动投影点 (绿色实心点)
         ax.scatter(projected_uv[:, 0], projected_uv[:, 1], s=20, c='green', label='Manual Proj (World->Cam->Img)')
 
-        # 连线 (骨架) 方便观察
         bones = [
             (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
             (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
             (0, 17), (17, 18), (18, 19), (19, 20)
         ]
 
-        # 画绿色的骨架 (手动投影)
         x_proj, y_proj = projected_uv[:, 0], projected_uv[:, 1]
         for start, end in bones:
             ax.plot([x_proj[start], x_proj[end]], [y_proj[start], y_proj[end]], 'g-', linewidth=1, alpha=0.7)

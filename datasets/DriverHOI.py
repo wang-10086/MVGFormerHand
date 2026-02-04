@@ -20,7 +20,7 @@ class DriverHOIDatasets(Dataset):
     def __init__(self,
                  root_dir: str,
                  split: str = 'train',  # 'train' or 'test'
-                 split_strategy: str = 'subject',  # [新增] 'subject' or 'random'
+                 split_strategy: str = 'subject',  # 'subject' or 'random'
                  camera_views: Optional[List[str]] = None,
                  target_size: Tuple[int, int] = (256, 256),
                  **kwargs):
@@ -48,11 +48,10 @@ class DriverHOIDatasets(Dataset):
             [d.name for d in self.data_root.iterdir() if d.is_dir() and d.name.startswith("subject")])
 
         # ---------------------------------------------------------------------
-        # [核心修改] 数据划分逻辑
+        # 数据划分逻辑
         # ---------------------------------------------------------------------
         if self.split_strategy == 'subject':
             # --- 策略 A: 按被试划分 (Subject Split) ---
-            # 逻辑: 训练集只看前 85% 的人，测试集看后 15% 的人
             total_subj = len(all_subjects)
             if total_subj > 0:
                 split_idx = int(0.85 * total_subj)
@@ -65,17 +64,13 @@ class DriverHOIDatasets(Dataset):
             else:
                 self.subjects = []
 
-            # 构建索引 (只包含选定 Subject 的数据)
             self.data_index = self._build_data_index()
 
         elif self.split_strategy == 'random':
             # --- 策略 B: 按比例随机划分 (Random Ratio Split) ---
-            # 逻辑: 使用所有被试的数据，混合在一起，切分 90% / 10%
             self.subjects = all_subjects  # 使用所有人
-            full_index = self._build_data_index()  # 获取所有帧
+            full_index = self._build_data_index()
 
-            # [关键] 使用固定的随机种子打乱，确保 Train 和 Test 互斥且互补
-            # 无论实例化多少次，shuffle 结果一致
             rnd = random.Random(42)
             rnd.shuffle(full_index)
 
@@ -88,8 +83,6 @@ class DriverHOIDatasets(Dataset):
 
         else:
             raise ValueError(f"Unknown split strategy: {self.split_strategy}")
-
-        # ---------------------------------------------------------------------
 
         self.right_hand_devices = set(range(1, 18)) | set(range(26, 30))
 
@@ -180,17 +173,13 @@ class DriverHOIDatasets(Dataset):
                             "view_paths": view_paths,
                             "json_path": json_path,
                             "subject": subj,
-                            "action": action_name,  # 动作
-                            "device_id": device_id,  # 设备ID
+                            "action": action_name,
+                            "device_id": device_id,
                             "frame_id": frame_stem
                         })
         return data_index
 
     def _load_keypoints(self, json_path: Path, action: str, device_id: int):
-        """
-        根据动作和设备ID，选择加载左手或右手。
-        仅选择，不做任何翻转。
-        """
         if not json_path.exists():
             return None
 
@@ -199,24 +188,19 @@ class DriverHOIDatasets(Dataset):
                 data = json.load(f)
             kp_data = data.get("keypoints3d", {})
 
-            # 1. 获取原始数据
             right_hand = np.array(kp_data.get("RightHand", []), dtype=np.float32)
             left_hand = np.array(kp_data.get("LeftHand", []), dtype=np.float32)
 
-            # 2. 判定目标手
-            target_is_right = True  # 默认为右手
+            target_is_right = True
 
             if action in ['push', 'swing']:
-                # 规则1: push/swing 始终是右手
                 target_is_right = True
             elif action in ['point', 'press']:
-                # 规则2: point/press 根据设备ID判断
                 if device_id in self.right_hand_devices:
                     target_is_right = True
                 else:
                     target_is_right = False
 
-            # 3. 选择数据
             hand = None
             if target_is_right:
                 if right_hand.shape == (21, 3):
@@ -225,11 +209,10 @@ class DriverHOIDatasets(Dataset):
                 if left_hand.shape == (21, 3):
                     hand = left_hand
 
-            # 如果没找到数据，返回空
             if hand is None:
                 return None
 
-            # 4. 坐标轴变换 [2, 0, 1] (保持 Z, X, Y 轴对齐)
+            # 坐标轴变换 [2, 0, 1]
             hand = hand[..., [2, 0, 1]]
 
             return torch.from_numpy(hand)
@@ -243,7 +226,7 @@ class DriverHOIDatasets(Dataset):
     def __getitem__(self, idx):
         item = self.data_index[idx]
 
-        # 根据逻辑加载对应的手（不翻转）
+        # 根据逻辑加载对应的手
         joints_3d = self._load_keypoints(
             item['json_path'],
             item['action'],
@@ -252,17 +235,20 @@ class DriverHOIDatasets(Dataset):
 
         if joints_3d is None:
             joints_3d = torch.zeros((21, 3), dtype=torch.float32)
-            valid_joints = 0.0
-        else:
-            valid_joints = 1.0
 
         list_imgs = []
         list_intrinsics = []
         list_extrinsics = []
         list_world_coords = []
 
+        # [新增] 初始化路径列表
+        list_img_paths = []
+
         for view_name in self.camera_views:
             img_path = item['view_paths'][view_name]
+
+            # [新增] 记录路径 (转为字符串)
+            list_img_paths.append(str(img_path))
 
             try:
                 img_pil = Image.open(img_path).convert("RGB")
@@ -308,13 +294,94 @@ class DriverHOIDatasets(Dataset):
             'extrinsic': torch.stack(list_extrinsics, dim=0),
         }
 
+        # [修改] 加入 img_paths
         meta_info = {
             'subject': item['subject'],
             'sample_idx': idx,
-            'frame_id': item['frame_id']
+            'frame_id': item['frame_id'],
+            'img_paths': list_img_paths,  # List of strings [path_view1, path_view2, ...]
         }
 
         return inputs, targets, meta_info
+
+    def print_gt_stats(self, sample_stride=1):
+        """
+        [工具函数] 统计 GT 3D 坐标分布，并在控制台打印建议的 SPACE_CENTER 和 SPACE_SIZE。
+
+        Args:
+            sample_stride (int): 采样步长。默认为 1，即每 1 个样本统计一次。
+        """
+        import torch
+        print(f"\n>>> 正在扫描 DriverHOI 数据集以计算 GT 统计信息 (每 {sample_stride} 个样本采样一次)...")
+
+        all_x, all_y, all_z = [], [], []
+        valid_samples_count = 0
+
+        # 遍历数据集索引
+        for i in range(0, len(self), sample_stride):
+            # 获取数据
+            try:
+                inputs, targets, meta = self.__getitem__(i)
+            except Exception as e:
+                print(f"Skipping index {i} due to error: {e}")
+                continue
+
+            # world_coord shape: (V, 21, 3)
+            world_coord = targets['world_coord']
+
+            # 过滤全0的无效数据 (DriverHOI 中没有标注时会返回0)
+            if world_coord.abs().sum() < 1e-6:
+                continue
+
+            valid_samples_count += 1
+
+            # 转为 Tensor 并拍平 -> (V*21, 3)
+            if not isinstance(world_coord, torch.Tensor):
+                coords = torch.from_numpy(world_coord).float()
+            else:
+                coords = world_coord.float()
+
+            coords = coords.view(-1, 3)  # (N_points, 3)
+
+            all_x.append(coords[:, 0])
+            all_y.append(coords[:, 1])
+            all_z.append(coords[:, 2])
+
+        if not all_x:
+            print("错误: 未找到任何有效的 world_coord 数据！")
+            return
+
+        # 拼接所有采样点
+        all_x = torch.cat(all_x)
+        all_y = torch.cat(all_y)
+        all_z = torch.cat(all_z)
+
+        # 计算统计量
+        min_x, max_x, mean_x = all_x.min().item(), all_x.max().item(), all_x.mean().item()
+        min_y, max_y, mean_y = all_y.min().item(), all_y.max().item(), all_y.mean().item()
+        min_z, max_z, mean_z = all_z.min().item(), all_z.max().item(), all_z.mean().item()
+
+        # 计算建议的配置
+        center = [mean_x, mean_y, mean_z]
+
+        # 计算跨度
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+        span_z = max_z - min_z
+
+        # 建议尺寸：最大跨度 * 1.2 (留 20% 余量)
+        size_val = max(span_x, span_y, span_z) * 1.2
+
+        print("=" * 60)
+        print(f" [DriverHOI 数据集 GT 统计结果 (基于 {valid_samples_count} 个有效样本)]")
+        print(f"  X 轴: 范围 [{min_x:.3f}, {max_x:.3f}], 均值 {mean_x:.3f}")
+        print(f"  Y 轴: 范围 [{min_y:.3f}, {max_y:.3f}], 均值 {mean_y:.3f}")
+        print(f"  Z 轴: 范围 [{min_z:.3f}, {max_z:.3f}], 均值 {mean_z:.3f}")
+        print("-" * 60)
+        print(f" [建议修改 config_hand.py]")
+        print(f"  SPACE_CENTER = [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
+        print(f"  SPACE_SIZE   = [{size_val:.4f}, {size_val:.4f}, {size_val:.4f}]")
+        print("=" * 60)
 
 
 # =============================================================================
@@ -345,6 +412,8 @@ if __name__ == "__main__":
     if len(dataset) == 0:
         print("数据集为空！请检查路径。")
         exit()
+
+    dataset.print_gt_stats(sample_stride=1)  # 采样步长越大越快，越小越准
 
     # 3. 随机寻找一个有效样本 (包含有效 3D 关键点)
     idx = 0

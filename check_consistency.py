@@ -6,7 +6,7 @@ import warnings
 # 忽略警告以便看清输出
 warnings.filterwarnings("ignore")
 
-from config_hand import _C as cfg
+from config import _C as cfg
 from datasets.DexYCB import DEXYCBDatasets
 from adapter import collate_dexycb_to_mvgformer
 

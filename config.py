@@ -1,46 +1,83 @@
-import torch
+import os
+from yacs.config import CfgNode as CN
 
+_C = CN()
 
-class Config:
-    # 数据集配置
-    datasets = 'dex-ycb'  # mhp or dex-ycb
-    root_dir = '/home/wk/wk/wk/datasets/DexYCB'   # mhp datasets: '/root/wk/datasets/mhp', dex-ycb dataset: '/root/wk/datasets/DexYCB'
-    save_dir = './checkpoints'
+# -----------------------------------------------------------------------------
+# 1. 模型与架构配置 (Model & Architecture)
+# -----------------------------------------------------------------------------
+_C.MODEL = CN()
+_C.MODEL.NAME = 'lvt'  # 可选: 'mvgformer', 'lat', 'lvt'
+_C.MODEL.BACKBONE = 'resnet50'
 
-    # 设备配置
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# -----------------------------------------------------------------------------
+# 2. 网络基础配置 (Network)
+# -----------------------------------------------------------------------------
+_C.NETWORK = CN()
+_C.NETWORK.IMAGE_SIZE = [256, 256]  # [H, W]
 
-    # MANO模型配置
-    mano_model_path = './manopth/mano/models'
-    use_mano = True
+# -----------------------------------------------------------------------------
+# 3. 数据集配置 (Dataset)
+# -----------------------------------------------------------------------------
+_C.DATASET = CN()
+_C.DATASET.NAME = 'driverhoi'  # 'dexycb' or 'driverhoi'
+_C.DATASET.SPLIT_STRATEGY = 'random'  # 'subject' or 'random'
+_C.DATASET.ROOT_DEXYCB = '/home/wk/wk/wk/datasets/DexYCB'
+_C.DATASET.ROOT_DRIVERHOI = '/home/wk/wk/wk/datasets/DriverHOI3D'
+_C.DATASET.CAMERA_NUM = 4  # 使用的视角数量
 
-    # 模型架构配置
-    model = 'hamuco'  # baseline or hamuco or mvhandfusion or resnetdlt or resnetdltfusion
-    backbone = 'resnet50'  # resnet18 or stacked_hourglass
-    num_view = 8
+# -----------------------------------------------------------------------------
+# 4. 训练配置 (Train)
+# -----------------------------------------------------------------------------
+_C.TRAIN = CN()
+_C.TRAIN.BATCH_SIZE = 8
+_C.TRAIN.NUM_WORKERS = 4  # 建议根据CPU核心数调整
+_C.TRAIN.LR = 1e-4
+_C.TRAIN.WEIGHT_DECAY = 1e-4
+_C.TRAIN.EPOCHS = 100
+_C.TRAIN.LR_STEP_SIZE = 20
+_C.TRAIN.LR_GAMMA = 0.5
+_C.TRAIN.RESUME_PATH = ''  # 断点续训的模型路径
 
-    # 手部模型配置
-    root_idx = 0
-    hand_root_mode = 0  # 0: use the wrist joint as root, 1: use the palm center as root
-    num_joints = 21
-    bbox_3d_size = 0.4
+# -----------------------------------------------------------------------------
+# 5. 测试与可视化配置 (Test)
+# -----------------------------------------------------------------------------
+_C.TEST = CN()
+_C.TEST.BATCH_SIZE = 1
+_C.TEST.TEST_CKPT = 'checkpoints/20260130_172533_lvt_dexycb/best_model.pth' # 测试用权重路径
+_C.TEST.VIZ = True           # 是否保存可视化结果
+_C.TEST.VIZ_FREQ = 10        # 可视化频率 (每N个Batch)
+_C.TEST.VIZ_DIR = './test_results/viz_output'
 
-    # 数据处理配置
-    data_normalization = False
-    input_img_shape = (256, 256)
+# -----------------------------------------------------------------------------
+# 6. 空间与几何配置 (Geometry & Volumetric)
+# -----------------------------------------------------------------------------
+_C.MULTI_PERSON = CN()
+# 3D 空间定义 (单位: 米)
+_C.MULTI_PERSON.SPACE_SIZE = [4.0, 4.0, 4.0]
+_C.MULTI_PERSON.SPACE_CENTER = [0.0, 0.0, 0.0]
+# 体素分辨率 (LVT模型使用)
+_C.MULTI_PERSON.VOL_SIZE = 64
 
-    # 训练参数
-    batch_size = 8
-    learning_rate = 0.001
-    num_epochs = 150
-    num_worker = 0
-    resume_checkpoint = None
-    description = 'use resnetdlt model'
+# -----------------------------------------------------------------------------
+# 7. 解码器与Loss配置 (Decoder & Loss)
+# -----------------------------------------------------------------------------
+_C.DECODER = CN()
+_C.DECODER.d_model = 256
+_C.DECODER.nhead = 8
+_C.DECODER.dim_feedforward = 1024
+_C.DECODER.dropout = 0.1
+_C.DECODER.num_decoder_layers = 4
+_C.DECODER.num_instance = 100 # Query 数量
+_C.DECODER.num_keypoints = 21
+_C.DECODER.use_feat_level = [0, 1, 2] # 使用 Backbone 的哪些层级特征
 
-    # 测试
-    test_checkpoint = '/root/wk/code/Multi-view_pose_estimation/checkpoints/2025-06-07_15-54-31/best_model.pth'
+# Loss 权重分配
+_C.DECODER.loss_pose_perjoint = 10.0         # 3D L1 Loss
+_C.DECODER.loss_pose_perprojection_2d = 1.0  # 2D Reprojection Loss
+_C.DECODER.loss_weight_loss_ce = 1.0         # Classification Loss
+_C.DECODER.cost_class = 2.0                  # Hungarian Matcher Class Cost
+_C.DECODER.cost_pose = 5.0                   # Hungarian Matcher Pose Cost
 
-    random_mask = False
-
-
-cfg = Config()
+# 导出全局配置对象
+cfg = _C

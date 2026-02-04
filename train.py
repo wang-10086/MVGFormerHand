@@ -3,10 +3,10 @@ import ssl
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 import os
 import sys
 import warnings
@@ -16,41 +16,69 @@ import csv
 import logging
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from collections import defaultdict
 
-from config_hand import _C as cfg
+# -----------------------------------------------------------------------------
+# 1. 导入配置与工具 (Imports)
+# -----------------------------------------------------------------------------
+# 使用新的统一配置
+from config import cfg
 from adapter import collate_dexycb_to_mvgformer
-# 引入两个数据集类
+
+# 数据集
 from datasets.DexYCB import DEXYCBDatasets
 from datasets.DriverHOI import DriverHOIDatasets
-from model import get_mvp
+
+# 模型导入 (从 models 文件夹)
+try:
+    from models.MVGFormer import get_mvgformer
+    from models.LAT import get_lat_model
+    from models.LVT import get_lvt_model
+except ImportError as e:
+    print(f"[Error] Failed to import models: {e}")
+    sys.exit(1)
 
 
+# -----------------------------------------------------------------------------
+# 2. 实验管理器 (Experiment Manager)
+# -----------------------------------------------------------------------------
 class ExperimentManager:
-    def __init__(self, base_dir="checkpoints"):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 将数据集名称加入实验文件夹，方便区分
-        exp_name = f"{timestamp}_{cfg.DATASET.NAME}"
-        self.exp_dir = os.path.join(base_dir, exp_name)
-        os.makedirs(self.exp_dir, exist_ok=True)
+    """管理实验文件夹创建、日志记录、TensorBoard 和 CSV 统计"""
 
-        self.writer = SummaryWriter(log_dir=os.path.join(self.exp_dir, "tb_logs"))
+    def __init__(self, base_dir="checkpoints"):
+        self.base_dir = base_dir
+        resume_path = cfg.TRAIN.RESUME_PATH
+        self.resuming = False
+
+        if resume_path and os.path.exists(resume_path):
+            self.exp_dir = os.path.dirname(resume_path)
+            self.resuming = True
+            print(f"[ExperimentManager] Resuming in: {self.exp_dir}")
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_name = f"{timestamp}_{cfg.MODEL.NAME}_{cfg.DATASET.NAME}"
+            self.exp_dir = os.path.join(base_dir, exp_name)
+            os.makedirs(self.exp_dir, exist_ok=True)
+            print(f"[ExperimentManager] Created: {self.exp_dir}")
+
         self.log_file = os.path.join(self.exp_dir, "output.out")
         self.logger = self._setup_logger()
-
+        self.writer = SummaryWriter(log_dir=os.path.join(self.exp_dir, "tb_logs"))
         self.csv_file = os.path.join(self.exp_dir, "training_stats.csv")
-        self.csv_headers = ["Epoch", "Train_Loss", "Train_L1", "Train_Proj", "Val_MPJPE", "Time_Elapsed"]
-        with open(self.csv_file, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(self.csv_headers)
+        self.csv_headers = ["Epoch", "Train_Total_Loss", "Val_MPJPE", "Time_Elapsed"]
 
-        self.logger.info(f"Experiment started! Artifacts saved in: {self.exp_dir}")
-        self.logger.info(f"Current Dataset Config: {cfg.DATASET.NAME}")
+        if not self.resuming or not os.path.exists(self.csv_file):
+            with open(self.csv_file, mode='w', newline='') as f:
+                csv.writer(f).writerow(self.csv_headers)
+
+        self.logger.info(f"Experiment Config: {cfg.MODEL.NAME} on {cfg.DATASET.NAME}")
 
     def _setup_logger(self):
         logger = logging.getLogger("Trainer")
         logger.setLevel(logging.INFO)
         if not logger.handlers:
-            fh = logging.FileHandler(self.log_file)
+            mode = 'a' if self.resuming else 'w'
+            fh = logging.FileHandler(self.log_file, mode=mode)
             fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
             ch = logging.StreamHandler(sys.stdout)
             ch.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
@@ -63,189 +91,170 @@ class ExperimentManager:
 
     def log_csv(self, row_data):
         with open(self.csv_file, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(row_data)
+            csv.writer(f).writerow(row_data)
 
-    def save_checkpoint(self, model, epoch, metric, is_best=False):
+    def save_checkpoint(self, model, optimizer, scheduler, epoch, metric, is_best=False):
+        model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
         state = {
             'epoch': epoch,
-            'state_dict': model.state_dict(),
+            'state_dict': model_state,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'mpjpe': metric,
-            'config': cfg,  # 保存配置以便复现
+            'config': cfg,  # 保存完整配置以便复现
         }
         torch.save(state, os.path.join(self.exp_dir, "last_model.pth"))
         if is_best:
             torch.save(state, os.path.join(self.exp_dir, "best_model.pth"))
-            self.log(f"New Best Model! MPJPE: {metric:.2f} mm")
+            self.log(f"New Best Model Saved! MPJPE: {metric:.2f} mm")
+
+
+# -----------------------------------------------------------------------------
+# 3. 辅助函数 (Utils)
+# -----------------------------------------------------------------------------
+def build_model(cfg, device):
+    """根据配置名称构建对应模型"""
+    model_name = cfg.MODEL.NAME.lower()
+    print(f"Building Model: {model_name} ...")
+
+    if model_name == 'mvgformer':
+        model = get_mvgformer(cfg, is_train=True)
+    elif model_name == 'lat':
+        model = get_lat_model(cfg)
+    elif model_name == 'lvt':
+        model = get_lvt_model(cfg)
+    else:
+        raise ValueError(f"Unknown Model Name: {model_name}")
+
+    return model.to(device)
 
 
 def compute_mpjpe(pred_poses, gt_poses):
-    error = torch.norm(pred_poses - gt_poses, dim=-1)
+    """计算 MPJPE (Mean Per Joint Position Error), 单位 mm"""
+    error = torch.norm(pred_poses - gt_poses, dim=-1)  # (B, 21)
     return error.mean().item() * 1000.0
 
 
 def validate(model, dataloader, device):
+    """验证循环"""
     model.eval()
     total_mpjpe = 0.0
     num_batches = 0
-
-    if hasattr(model, 'matcher'):
-        matcher = model.matcher
-    elif hasattr(model.module, 'matcher'):
-        matcher = model.module.matcher
-    else:
-        matcher = None
 
     with torch.no_grad():
         for batch_inputs, batch_targets, _ in tqdm(dataloader, desc="Validating", leave=False):
             views, meta = collate_dexycb_to_mvgformer(batch_inputs, batch_targets, device)
             outputs, _ = model(views, meta)
 
-            pred_all = outputs['pred_poses']['outputs_coord']
-            B = pred_all.shape[0]
-            pred_poses_reshaped = pred_all.view(B, cfg.DECODER.num_instance, 21, 3)
-            pred_logits = outputs['pred_logits']
-            pred_probs = pred_logits.view(B, cfg.DECODER.num_instance, 21, 1).mean(dim=2).sigmoid()
-            gt_poses = torch.stack([m['joints_3d'] for m in meta]).squeeze(1).to(device)
-
-            batch_error = 0.0
-            if matcher is not None:
-                indices = matcher(pred_probs, pred_poses_reshaped, gt_poses)
-                for b in range(B):
-                    src_idx, tgt_idx = indices[b]
-                    best_idx = src_idx.item()
-                    pred_pose = pred_poses_reshaped[b, best_idx]
-                    gt_pose = gt_poses[b]
-                    batch_error += compute_mpjpe(pred_pose, gt_pose)
+            # 统一输出接口
+            if 'final_pred_poses' in outputs:
+                pred_poses = outputs['final_pred_poses']
             else:
-                for b in range(B):
-                    gt_b = gt_poses[b]
-                    preds_b = pred_poses_reshaped[b]
-                    diff = preds_b - gt_b.unsqueeze(0)
-                    errors = torch.norm(diff, dim=-1).mean(dim=-1)
-                    min_error_m = errors.min().item()
-                    batch_error += (min_error_m * 1000.0)
+                pred_poses = outputs['pred_poses']['outputs_coord']
 
-            total_mpjpe += (batch_error / B)
+            if pred_poses.dim() == 4: pred_poses = pred_poses.squeeze(1)
+
+            gt_poses = torch.stack([m['joints_3d'] for m in meta])
+            if gt_poses.dim() == 4: gt_poses = gt_poses.squeeze(1)
+            gt_poses = gt_poses.to(device)
+
+            total_mpjpe += compute_mpjpe(pred_poses, gt_poses)
             num_batches += 1
 
     return total_mpjpe / num_batches if num_batches > 0 else 0.0
 
 
+# -----------------------------------------------------------------------------
+# 4. 主程序 (Main)
+# -----------------------------------------------------------------------------
 def main():
     warnings.filterwarnings("ignore")
-
     exp_manager = ExperimentManager()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     exp_manager.log(f"Using device: {device}")
 
-    # -----------------------------------------------------------
-    # [核心修改] 根据 config 动态加载数据集
-    # -----------------------------------------------------------
+    # 1. 数据集加载
     dataset_name = cfg.DATASET.NAME.lower()
-    split_strategy = cfg.DATASET.SPLIT_STRATEGY  # 获取策略
-    exp_manager.log(f"Initializing Dataset: {dataset_name} ...")
+    root_dir = cfg.DATASET.ROOT_DEXYCB if dataset_name == 'dexycb' else cfg.DATASET.ROOT_DRIVERHOI
+    DatasetClass = DEXYCBDatasets if dataset_name == 'dexycb' else DriverHOIDatasets
 
-    if dataset_name == 'dexycb':
-        root_dir = cfg.DATASET.ROOT_DEXYCB
-        train_dataset = DEXYCBDatasets(root_dir=root_dir, split='train', split_strategy=split_strategy)
-        val_dataset = DEXYCBDatasets(root_dir=root_dir, split='test', split_strategy=split_strategy)
+    train_dataset = DatasetClass(root_dir=root_dir, split='train', split_strategy=cfg.DATASET.SPLIT_STRATEGY)
+    val_dataset = DatasetClass(root_dir=root_dir, split='test', split_strategy=cfg.DATASET.SPLIT_STRATEGY)
 
-    elif dataset_name == 'driverhoi':
-        root_dir = cfg.DATASET.ROOT_DRIVERHOI
-        train_dataset = DriverHOIDatasets(root_dir=root_dir, split='train', split_strategy=split_strategy)
-        val_dataset = DriverHOIDatasets(root_dir=root_dir, split='test', split_strategy=split_strategy)
+    train_loader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=True,
+                              num_workers=cfg.TRAIN.NUM_WORKERS, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=False,
+                            num_workers=cfg.TRAIN.NUM_WORKERS, drop_last=False)
 
-    else:
-        raise ValueError(f"Unknown dataset name in config: {dataset_name}")
+    # 2. 构建模型与优化器
+    model = build_model(cfg, device)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.TRAIN.LR, weight_decay=cfg.TRAIN.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=cfg.TRAIN.LR_STEP_SIZE, gamma=cfg.TRAIN.LR_GAMMA)
 
-    exp_manager.log(f"Train samples: {len(train_dataset)}")
-    exp_manager.log(f"Val   samples: {len(val_dataset)}")
-
-    # -----------------------------------------------------------
-
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=0, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=0, drop_last=False)
-
-    exp_manager.log("Building Model...")
-    model = get_mvp(cfg, is_train=True).to(device)
-
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
-
-    exp_manager.log(">>> Start Training <<<")
+    # 3. 恢复权重
+    start_epoch = 0
     best_mpjpe = float('inf')
-    num_epochs = 100
+    if cfg.TRAIN.RESUME_PATH and os.path.exists(cfg.TRAIN.RESUME_PATH):
+        ckpt = torch.load(cfg.TRAIN.RESUME_PATH, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        start_epoch = ckpt['epoch']
+        best_mpjpe = ckpt.get('mpjpe', float('inf'))
+        exp_manager.log(f"Resumed from Epoch {start_epoch}. Best MPJPE: {best_mpjpe:.2f}")
 
-    for epoch in range(num_epochs):
+    # 4. 训练循环
+    exp_manager.log(">>> Start Training <<<")
+    for epoch in range(start_epoch, cfg.TRAIN.EPOCHS):
         start_time = time.time()
         model.train()
+        loss_meters = defaultdict(float)
+        total_loss_meter = 0.0
 
-        total_loss = 0.0
-        total_l1 = 0.0
-        total_proj = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg.TRAIN.EPOCHS}", unit="batch")
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]", unit="batch")
-
-        for i, (batch_inputs, batch_targets, _) in enumerate(pbar):
+        for batch_inputs, batch_targets, _ in pbar:
             views, meta = collate_dexycb_to_mvgformer(batch_inputs, batch_targets, device)
-            out, loss_dict = model(views, meta)
+            _, loss_dict = model(views, meta)
 
-            loss_total = torch.tensor(0.0).to(device)
-            l1_loss = loss_dict.get('loss_pose_perjoint', torch.tensor(0.0).to(device))
-            proj_loss = loss_dict.get('loss_pose_perprojection_2d', torch.tensor(0.0).to(device))
-            ce_loss = loss_dict.get('loss_ce', torch.tensor(0.0).to(device))
-
-            if 'loss_pose_perjoint' in loss_dict:
-                loss_total += l1_loss * cfg.DECODER.loss_pose_perjoint
-            if 'loss_pose_perprojection_2d' in loss_dict:
-                loss_total += proj_loss * cfg.DECODER.loss_pose_perprojection_2d
-            if 'loss_ce' in loss_dict:
-                loss_total += ce_loss * cfg.DECODER.loss_weight_loss_ce
-
-            for k, v in loss_dict.items():
-                if '_0' in k or '_1' in k:
-                    base = k.rsplit('_', 1)[0]
-                    if base == 'loss_pose_perjoint':
-                        loss_total += v * cfg.DECODER.loss_pose_perjoint
-                    elif base == 'loss_pose_perprojection_2d':
-                        loss_total += v * cfg.DECODER.loss_pose_perprojection_2d
+            loss_total = sum(loss_dict.values())
 
             optimizer.zero_grad()
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             optimizer.step()
 
-            total_loss += loss_total.item()
-            total_l1 += l1_loss.item()
-            total_proj += proj_loss.item()
+            total_loss_meter += loss_total.item()
 
-            pbar.set_postfix({"L1": f"{l1_loss.item():.4f}", "Proj": f"{proj_loss.item():.2f}"})
+            # 更新进度条显示
+            postfix_str = f"Total: {loss_total.item():.2f}"
+            for k, v in loss_dict.items():
+                val = v.item()
+                loss_meters[k] += val
+                postfix_str += f" | {k.replace('loss_', '')}: {val:.4f}"
+            pbar.set_postfix_str(postfix_str)
 
-        avg_loss = total_loss / len(train_loader)
-        avg_l1 = total_l1 / len(train_loader)
-        avg_proj = total_proj / len(train_loader)
+        # Epoch 结束处理
+        avg_total_loss = total_loss_meter / len(train_loader)
+        avg_sub_losses = {k: v / len(train_loader) for k, v in loss_meters.items()}
 
         val_mpjpe = validate(model, val_loader, device)
         scheduler.step()
-
         elapsed = time.time() - start_time
-        log_str = (f"Epoch {epoch + 1} | "
-                   f"Loss: {avg_loss:.4f} (L1: {avg_l1:.4f}, Proj: {avg_proj:.2f}) | "
-                   f"Val MPJPE: {val_mpjpe:.2f} mm | "
-                   f"Time: {elapsed:.0f}s")
-        exp_manager.log(log_str)
 
-        exp_manager.writer.add_scalar('Train/Loss', avg_loss, epoch)
-        exp_manager.writer.add_scalar('Train/L1', avg_l1, epoch)
-        exp_manager.writer.add_scalar('Train/Proj', avg_proj, epoch)
-        exp_manager.writer.add_scalar('Val/MPJPE_mm', val_mpjpe, epoch)
-        exp_manager.log_csv([epoch + 1, avg_loss, avg_l1, avg_proj, val_mpjpe, elapsed])
+        # 记录与保存
+        exp_manager.log(
+            f"Epoch {epoch + 1} | Time: {elapsed:.0f}s | Val MPJPE: {val_mpjpe:.2f} | Loss: {avg_total_loss:.4f}")
+        exp_manager.writer.add_scalar('Train/Total_Loss', avg_total_loss, epoch)
+        exp_manager.writer.add_scalar('Val/MPJPE', val_mpjpe, epoch)
+        for k, v in avg_sub_losses.items():
+            exp_manager.writer.add_scalar(f'Train/{k}', v, epoch)
+
+        exp_manager.log_csv([epoch + 1, avg_total_loss, val_mpjpe, elapsed])
 
         is_best = val_mpjpe < best_mpjpe
-        if is_best:
-            best_mpjpe = val_mpjpe
-        exp_manager.save_checkpoint(model, epoch + 1, val_mpjpe, is_best=is_best)
+        if is_best: best_mpjpe = val_mpjpe
+        exp_manager.save_checkpoint(model, optimizer, scheduler, epoch + 1, val_mpjpe, is_best)
 
     exp_manager.log("Training Finished.")
     exp_manager.writer.close()
