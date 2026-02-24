@@ -21,19 +21,17 @@ from collections import defaultdict
 # -----------------------------------------------------------------------------
 # 1. 导入配置与工具 (Imports)
 # -----------------------------------------------------------------------------
-# 使用新的统一配置
 from config import cfg
 from adapter import collate_dexycb_to_mvgformer
 
-# 数据集
 from datasets.DexYCB import DEXYCBDatasets
 from datasets.DriverHOI import DriverHOIDatasets
 
-# 模型导入 (从 models 文件夹)
 try:
     from models.MVGFormer import get_mvgformer
     from models.LAT import get_lat_model
     from models.LVT import get_lvt_model
+    from models.SelfSupMVGFormer import get_self_sup_mvgformer
 except ImportError as e:
     print(f"[Error] Failed to import models: {e}")
     sys.exit(1)
@@ -101,7 +99,7 @@ class ExperimentManager:
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'mpjpe': metric,
-            'config': cfg,  # 保存完整配置以便复现
+            'config': cfg,
         }
         torch.save(state, os.path.join(self.exp_dir, "last_model.pth"))
         if is_best:
@@ -123,6 +121,8 @@ def build_model(cfg, device):
         model = get_lat_model(cfg)
     elif model_name == 'lvt':
         model = get_lvt_model(cfg)
+    elif model_name == 'self_sup_mvgformer':
+        model = get_self_sup_mvgformer(cfg, is_train=True)
     else:
         raise ValueError(f"Unknown Model Name: {model_name}")
 
@@ -130,23 +130,61 @@ def build_model(cfg, device):
 
 
 def compute_mpjpe(pred_poses, gt_poses):
-    """计算 MPJPE (Mean Per Joint Position Error), 单位 mm"""
-    error = torch.norm(pred_poses - gt_poses, dim=-1)  # (B, 21)
-    return error.mean().item() * 1000.0
+    """
+    [终极物理拦截版] 计算 MPJPE。
+    利用 3D 跨度和合理的物理深度，彻底隔离幽灵样本，并打印出它们的真面目。
+    """
+    # 1. 跨度过滤：手不能是一个点
+    hand_span = gt_poses.max(dim=1)[0] - gt_poses.min(dim=1)[0]
+    valid_span = hand_span.sum(dim=-1) > 0.01
+
+    # 2. 深度过滤：DexYCB 是桌面场景，手不可能贴在镜头上(Z<0.1m)，也不可能在3米外(Z>3.0m)
+    # 取手腕(第0个点)的 Z 坐标(深度)
+    gt_z = gt_poses[:, 0, 2]
+    valid_depth = (gt_z > 0.1) & (gt_z < 3.0)
+
+    # 3. 终极有效 Mask
+    valid_mask = valid_span & valid_depth
+
+    # # --- 打印被拦截的幽灵样本 ---
+    # invalid_mask = ~valid_mask
+    # if invalid_mask.any():
+    #     bad_gt = gt_poses[invalid_mask][0]  # 取出第一个坏样本
+    #     # 偶尔打印一次，看看这些 GT 到底填了什么鬼数据
+    #     if torch.rand(1).item() < 0.05:
+    #         print(
+    #             f"\n[拦截到幽灵 GT!] 腕部坐标: {bad_gt[0].cpu().numpy()}, 跨度和: {hand_span[invalid_mask][0].sum().item():.4f}")
+    # # --------------------------------------
+
+    if valid_mask.sum() == 0:
+        return 0.0, 0
+
+    valid_pred = pred_poses[valid_mask]
+    valid_gt = gt_poses[valid_mask]
+
+    # 计算误差
+    error = torch.norm(valid_pred - valid_gt, dim=-1)  # (Valid_B, 21)
+
+    # # 如果有效样本中依然出现了离谱误差（大于 100mm = 10厘米），打印它的预测深度
+    # bad_pred_idx = error.mean(dim=-1) > 0.100
+    # if bad_pred_idx.any() and torch.rand(1).item() < 0.05:
+    #     print(
+    #         f"\n[异常预测报警!] MPJPE > 100mm. 预测深度 Z={valid_pred[bad_pred_idx][0, 0, 2].item():.2f}m, GT 深度 Z={valid_gt[bad_pred_idx][0, 0, 2].item():.2f}m")
+
+    return error.sum().item() * 1000.0, valid_mask.sum().item() * 21
 
 
 def validate(model, dataloader, device):
     """验证循环"""
     model.eval()
-    total_mpjpe = 0.0
-    num_batches = 0
+    total_mpjpe_sum = 0.0
+    total_valid_joints = 0  # 记录有效关节点总数
 
     with torch.no_grad():
         for batch_inputs, batch_targets, _ in tqdm(dataloader, desc="Validating", leave=False):
             views, meta = collate_dexycb_to_mvgformer(batch_inputs, batch_targets, device)
             outputs, _ = model(views, meta)
 
-            # 统一输出接口
             if 'final_pred_poses' in outputs:
                 pred_poses = outputs['final_pred_poses']
             else:
@@ -158,10 +196,13 @@ def validate(model, dataloader, device):
             if gt_poses.dim() == 4: gt_poses = gt_poses.squeeze(1)
             gt_poses = gt_poses.to(device)
 
-            total_mpjpe += compute_mpjpe(pred_poses, gt_poses)
-            num_batches += 1
+            # [修改] 使用新的统计方式累加误差和点数
+            err_sum, valid_count = compute_mpjpe(pred_poses, gt_poses)
+            total_mpjpe_sum += err_sum
+            total_valid_joints += valid_count
 
-    return total_mpjpe / num_batches if num_batches > 0 else 0.0
+    # 计算均值，防止除以 0 报错
+    return total_mpjpe_sum / total_valid_joints if total_valid_joints > 0 else 0.0
 
 
 # -----------------------------------------------------------------------------

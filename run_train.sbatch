@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=mvg_hand       # 作业名称
 #SBATCH --partition=GPU           # 分区名称
-#SBATCH --gres=gpu:rtx5090:1      # 申请资源
+#SBATCH --gres=gpu:rtx6000ada:1      # 申请资源
 #SBATCH --cpus-per-task=8         # 申请CPU核数: 建议8核以配合DataLoader的多线程
 #SBATCH --mem=32G                 # 申请内存
 #SBATCH --output=logs/train_%j.out # 标准输出日志 (需先创建logs文件夹: mkdir logs)

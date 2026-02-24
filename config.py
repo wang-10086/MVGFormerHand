@@ -7,7 +7,7 @@ _C = CN()
 # 1. 模型与架构配置 (Model & Architecture)
 # -----------------------------------------------------------------------------
 _C.MODEL = CN()
-_C.MODEL.NAME = 'lvt'  # 可选: 'mvgformer', 'lat', 'lvt'
+_C.MODEL.NAME = 'self_sup_mvgformer'  # 可选: 'mvgformer', 'lat', 'lvt', 'self_sup_mvgformer'
 _C.MODEL.BACKBONE = 'resnet50'
 
 # -----------------------------------------------------------------------------
@@ -20,18 +20,18 @@ _C.NETWORK.IMAGE_SIZE = [256, 256]  # [H, W]
 # 3. 数据集配置 (Dataset)
 # -----------------------------------------------------------------------------
 _C.DATASET = CN()
-_C.DATASET.NAME = 'driverhoi'  # 'dexycb' or 'driverhoi'
+_C.DATASET.NAME = 'dexycb'  # 'dexycb' or 'driverhoi'
 _C.DATASET.SPLIT_STRATEGY = 'random'  # 'subject' or 'random'
 _C.DATASET.ROOT_DEXYCB = '/home/wk/wk/wk/datasets/DexYCB'
 _C.DATASET.ROOT_DRIVERHOI = '/home/wk/wk/wk/datasets/DriverHOI3D'
-_C.DATASET.CAMERA_NUM = 4  # 使用的视角数量
+_C.DATASET.CAMERA_NUM = 8  # 使用的视角数量
 
 # -----------------------------------------------------------------------------
 # 4. 训练配置 (Train)
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
 _C.TRAIN.BATCH_SIZE = 8
-_C.TRAIN.NUM_WORKERS = 4  # 建议根据CPU核心数调整
+_C.TRAIN.NUM_WORKERS = 0  # 建议根据CPU核心数调整
 _C.TRAIN.LR = 1e-4
 _C.TRAIN.WEIGHT_DECAY = 1e-4
 _C.TRAIN.EPOCHS = 100
@@ -78,6 +78,7 @@ _C.DECODER.loss_pose_perprojection_2d = 1.0  # 2D Reprojection Loss
 _C.DECODER.loss_weight_loss_ce = 1.0         # Classification Loss
 _C.DECODER.cost_class = 2.0                  # Hungarian Matcher Class Cost
 _C.DECODER.cost_pose = 5.0                   # Hungarian Matcher Pose Cost
+_C.DECODER.loss_bone_prior = 100.0
 
 # 导出全局配置对象
 cfg = _C
