@@ -1,8 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="wk@hpc.erglab.cn:2022 password (5)" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@connect.bjb2.seetacloud.com:13722 password (2)" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
+      <paths name="root@connect.bjb2.seetacloud.com:13722 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/MVGFormerHand" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@connect.bjb2.seetacloud.com:13722 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/MVGFormerHand" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@ymtjwxjdhomv3nsfsnow.deepln.com:54258 password">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="wk@hpc.erglab.cn:2022 password">
         <serverdata>
           <mappings>
@@ -35,6 +56,13 @@
         <serverdata>
           <mappings>
             <mapping deploy="/home/wk/wk/wk/code/MVGFormerHand" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="wk@hpc.erglab.cn:2022 password (6)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

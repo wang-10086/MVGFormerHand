@@ -263,8 +263,8 @@ class SelfSupMVGFormerHand(nn.Module):
         for s, e in self.hand_skeleton:
             bone_len = torch.norm(valid_poses[:, s, :] - valid_poses[:, e, :], dim=-1)
             # 采用 L1 约束 (F.relu 且不平方)
-            too_long = F.relu(bone_len - 0.045)
-            too_short = F.relu(0.02 - bone_len)
+            too_long = F.relu(bone_len - 0.06)
+            too_short = F.relu(0.01 - bone_len)
             loss += (too_long.mean() + too_short.mean())
 
         # 保持大权重，推开重叠点

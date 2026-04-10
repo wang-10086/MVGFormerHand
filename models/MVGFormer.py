@@ -135,6 +135,9 @@ class ProjectiveAttention(nn.Module):
         fused_feat = multi_scale_feat.sum(dim=1) / (valid_mask.sum(dim=1).clamp(min=1.0))  # (B, N_q, C)
 
         # Residual & Norm
+        # [Note] 此处的 query 对应解码器层输入的 tgt (内容特征向量)，之所以命名为query是旨在保持注意力机制的签名一致性。
+        # 鉴于几何投影已替代了传统的 Q-K 空间寻址，该 query 目前主要作为残差聚合的基底，用于累积新采样的视觉特征。
+        # 扩展方向：在局部遮挡场景下，可利用 query 的高阶语义计算动态视角置信度权重。
         output = query + self.dropout(self.output_proj(fused_feat))
         output = self.norm(output)
 

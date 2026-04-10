@@ -20,18 +20,18 @@ _C.NETWORK.IMAGE_SIZE = [256, 256]  # [H, W]
 # 3. 数据集配置 (Dataset)
 # -----------------------------------------------------------------------------
 _C.DATASET = CN()
-_C.DATASET.NAME = 'dexycb'  # 'dexycb' or 'driverhoi'
+_C.DATASET.NAME = 'driverhoi'  # 'dexycb' or 'driverhoi'
 _C.DATASET.SPLIT_STRATEGY = 'random'  # 'subject' or 'random'
-_C.DATASET.ROOT_DEXYCB = '/home/wk/wk/wk/datasets/DexYCB'
-_C.DATASET.ROOT_DRIVERHOI = '/home/wk/wk/wk/datasets/DriverHOI3D'
-_C.DATASET.CAMERA_NUM = 8  # 使用的视角数量
+_C.DATASET.ROOT_DEXYCB = '/root/autodl-tmp/DexYCB'
+_C.DATASET.ROOT_DRIVERHOI = '/root/autodl-tmp/DriverHOI3D'
+_C.DATASET.CAMERA_NUM = 4  # 使用的视角数量
 
 # -----------------------------------------------------------------------------
 # 4. 训练配置 (Train)
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
 _C.TRAIN.BATCH_SIZE = 8
-_C.TRAIN.NUM_WORKERS = 0  # 建议根据CPU核心数调整
+_C.TRAIN.NUM_WORKERS = 4  # 建议根据CPU核心数调整
 _C.TRAIN.LR = 1e-4
 _C.TRAIN.WEIGHT_DECAY = 1e-4
 _C.TRAIN.EPOCHS = 100
@@ -44,9 +44,9 @@ _C.TRAIN.RESUME_PATH = ''  # 断点续训的模型路径
 # -----------------------------------------------------------------------------
 _C.TEST = CN()
 _C.TEST.BATCH_SIZE = 1
-_C.TEST.TEST_CKPT = 'checkpoints/20260130_172533_lvt_dexycb/best_model.pth' # 测试用权重路径
+_C.TEST.TEST_CKPT = 'checkpoints/20260225_163757_self_sup_mvgformer_driverhoi/best_model.pth' # 测试用权重路径
 _C.TEST.VIZ = True           # 是否保存可视化结果
-_C.TEST.VIZ_FREQ = 10        # 可视化频率 (每N个Batch)
+_C.TEST.VIZ_FREQ = 1        # 可视化频率 (每N个Batch)
 _C.TEST.VIZ_DIR = './test_results/viz_output'
 
 # -----------------------------------------------------------------------------
@@ -57,7 +57,7 @@ _C.MULTI_PERSON = CN()
 _C.MULTI_PERSON.SPACE_SIZE = [4.0, 4.0, 4.0]
 _C.MULTI_PERSON.SPACE_CENTER = [0.0, 0.0, 0.0]
 # 体素分辨率 (LVT模型使用)
-_C.MULTI_PERSON.VOL_SIZE = 64
+_C.MULTI_PERSON.VOL_SIZE = 96
 
 # -----------------------------------------------------------------------------
 # 7. 解码器与Loss配置 (Decoder & Loss)
