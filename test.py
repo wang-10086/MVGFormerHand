@@ -329,6 +329,11 @@ def main():
     model.load_state_dict(state_dict)
     model.eval()
 
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable ({total_params/1e6:.2f}M)")
+
     viz_save_dir = f"{cfg.TEST.VIZ_DIR}_{cfg.MODEL.NAME}"
     net_h, net_w = cfg.NETWORK.IMAGE_SIZE
 

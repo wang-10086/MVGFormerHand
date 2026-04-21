@@ -143,6 +143,172 @@ class ProjectiveAttention(nn.Module):
 
         return output
 
+class VanillaCrossAttention(nn.Module):
+    """
+    加强版标准交叉注意力基线。
+    改进点：
+      1. 将 reference_points_3d 编码为 query 的位置嵌入（不做投影，只提供 3D 空间感知）
+      2. 对 KV 特征图做空间池化，大幅缩短序列长度
+      3. 保留视角/尺度/空间三层位置编码
+    仍然不使用任何相机参数做几何投影。
+    """
+
+    def __init__(self, d_model, n_heads, n_levels, n_views, dropout=0.1, pool_factor=4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_levels = n_levels
+        self.n_views = n_views
+        self.pool_factor = pool_factor
+
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.output_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+        # [改进1] 3D 坐标 → query 位置嵌入
+        self.query_pos_mlp = nn.Sequential(
+            nn.Linear(3, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
+        )
+
+        # [保留] KV 端位置编码
+        self.view_embed = nn.Embedding(n_views, d_model)
+        self.level_embed = nn.Embedding(n_levels, d_model)
+
+    def _build_2d_sincos_pos(self, H, W, C, device):
+        assert C % 4 == 0
+        half_C = C // 2
+        ys = torch.arange(H, device=device).unsqueeze(1).expand(H, W).reshape(-1).float()
+        xs = torch.arange(W, device=device).unsqueeze(0).expand(H, W).reshape(-1).float()
+        dim_t = torch.arange(half_C // 2, device=device).float()
+        dim_t = 10000.0 ** (2 * dim_t / half_C)
+        pe_x = torch.stack([torch.sin(xs[:, None] / dim_t),
+                            torch.cos(xs[:, None] / dim_t)], dim=-1).reshape(-1, half_C)
+        pe_y = torch.stack([torch.sin(ys[:, None] / dim_t),
+                            torch.cos(ys[:, None] / dim_t)], dim=-1).reshape(-1, half_C)
+        return torch.cat([pe_x, pe_y], dim=-1)
+
+    def forward(self, query, reference_points_3d, views_feats, cameras, img_size):
+        B, N_q, C = query.shape
+
+        # [改进1] 给 query 注入 3D 空间位置感知
+        query_pos_3d = self.query_pos_mlp(reference_points_3d)  # (B, N_q, C)
+        query = query + query_pos_3d
+
+        # [改进2] 构建紧凑 KV 序列
+        kv_list = []
+        for lvl, feats in enumerate(views_feats):
+            _B, V, _C, H_l, W_l = feats.shape
+
+            # 空间池化: 缩短 KV 长度
+            if H_l > self.pool_factor:
+                feats_pooled = F.avg_pool2d(
+                    feats.flatten(0, 1),          # (B*V, C, H, W)
+                    kernel_size=self.pool_factor,
+                    stride=self.pool_factor
+                )                                  # (B*V, C, H', W')
+                feats_pooled = feats_pooled.view(B, V, C,
+                    feats_pooled.shape[2], feats_pooled.shape[3])
+            else:
+                feats_pooled = feats
+
+            H_p, W_p = feats_pooled.shape[3], feats_pooled.shape[4]
+            feat_flat = feats_pooled.permute(0, 1, 3, 4, 2).reshape(B, V, H_p * W_p, C)
+
+            # KV 端位置编码
+            spatial_pe = self._build_2d_sincos_pos(H_p, W_p, C, feats.device)
+            feat_flat = feat_flat + spatial_pe.unsqueeze(0).unsqueeze(0)
+            feat_flat = feat_flat + self.view_embed.weight[:V].unsqueeze(0).unsqueeze(2)
+            feat_flat = feat_flat + self.level_embed.weight[lvl]
+
+            kv_list.append(feat_flat.reshape(B, V * H_p * W_p, C))
+
+        memory = torch.cat(kv_list, dim=1)
+
+        # 标准交叉注意力
+        out, _ = self.cross_attn(query, memory, memory)
+
+        output = query + self.dropout(self.output_proj(out))
+        output = self.norm(output)
+        return output
+
+# class VanillaCrossAttention(nn.Module):
+#     """
+#     带位置编码的标准交叉注意力基线。
+#     将多视角多尺度特征 flatten 为 KV 序列，加上视角/空间/尺度三层位置编码后，
+#     query 通过 nn.MultiheadAttention 做标准 dot-product attention。
+#     不使用任何几何投影信息。
+#     """
+#
+#     def __init__(self, d_model, n_heads, n_levels, n_views, dropout=0.1):
+#         super().__init__()
+#         self.d_model = d_model
+#         self.n_levels = n_levels
+#         self.n_views = n_views
+#
+#         self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+#         self.output_proj = nn.Linear(d_model, d_model)
+#         self.dropout = nn.Dropout(dropout)
+#         self.norm = nn.LayerNorm(d_model)
+#
+#         # ---- 位置编码 ----
+#         # 1) 视角编码: 区分来自哪个相机
+#         self.view_embed = nn.Embedding(n_views, d_model)
+#         # 2) 尺度编码: 区分来自哪一层特征图
+#         self.level_embed = nn.Embedding(n_levels, d_model)
+#         # 3) 2D 空间编码: 区分特征图上的空间位置 (正弦编码, 不可学习)
+#         #    在 forward 中按实际 H, W 动态生成
+#
+#     def _build_2d_sincos_pos(self, H, W, C, device):
+#         """生成 2D 正弦余弦位置编码 (H*W, C)"""
+#         assert C % 4 == 0, "d_model must be divisible by 4 for 2D sincos PE"
+#         half_C = C // 2
+#         ys = torch.arange(H, device=device).unsqueeze(1).expand(H, W).reshape(-1).float()
+#         xs = torch.arange(W, device=device).unsqueeze(0).expand(H, W).reshape(-1).float()
+#
+#         dim_t = torch.arange(half_C // 2, device=device).float()
+#         dim_t = 10000.0 ** (2 * dim_t / half_C)
+#
+#         pe_x = torch.stack([torch.sin(xs[:, None] / dim_t), torch.cos(xs[:, None] / dim_t)], dim=-1).reshape(-1, half_C)
+#         pe_y = torch.stack([torch.sin(ys[:, None] / dim_t), torch.cos(ys[:, None] / dim_t)], dim=-1).reshape(-1, half_C)
+#
+#         return torch.cat([pe_x, pe_y], dim=-1)  # (H*W, C)
+#
+#     def forward(self, query, reference_points_3d, views_feats, cameras, img_size):
+#         """
+#         与 ProjectiveAttention 保持完全相同的函数签名，
+#         但忽略 reference_points_3d、cameras、img_size。
+#         """
+#         B, N_q, C = query.shape
+#
+#         kv_list = []
+#         for lvl, feats in enumerate(views_feats):
+#             # feats: (B, V, C, H_l, W_l)
+#             _B, V, _C, H_l, W_l = feats.shape
+#
+#             # 展平空间维: (B, V, C, H, W) -> (B, V, H*W, C)
+#             feat_flat = feats.permute(0, 1, 3, 4, 2).reshape(B, V, H_l * W_l, C)
+#
+#             # 加位置编码
+#             spatial_pe = self._build_2d_sincos_pos(H_l, W_l, C, feats.device)  # (H*W, C)
+#             feat_flat = feat_flat + spatial_pe.unsqueeze(0).unsqueeze(0)        # 空间位置
+#             feat_flat = feat_flat + self.view_embed.weight[:V].unsqueeze(0).unsqueeze(2)  # 视角
+#             feat_flat = feat_flat + self.level_embed.weight[lvl]                # 尺度
+#
+#             # (B, V, H*W, C) -> (B, V*H*W, C)
+#             kv_list.append(feat_flat.reshape(B, V * H_l * W_l, C))
+#
+#         memory = torch.cat(kv_list, dim=1)  # (B, total_tokens, C)
+#
+#         # 标准交叉注意力
+#         out, _ = self.cross_attn(query, memory, memory)
+#
+#         # 残差 + LayerNorm
+#         output = query + self.dropout(self.output_proj(out))
+#         output = self.norm(output)
+#
+#         return output
 
 # ------------------------------------------------------------------------------------------------
 # 3. 解码器 (Transformer Decoder)

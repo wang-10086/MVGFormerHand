@@ -5,7 +5,7 @@ import torchvision
 from scipy.optimize import linear_sum_assignment
 
 # 复用原有的基础组件
-from models.MVGFormer import MLP, batch_project_points, ProjectiveAttention, MVGDecoderLayer, Backbone
+from models.MVGFormer import MLP, batch_project_points, ProjectiveAttention, VanillaCrossAttention, MVGDecoderLayer, Backbone
 
 
 # ------------------------------------------------------------------------------------------------
@@ -80,11 +80,19 @@ class SelfSupMVGDecoder(nn.Module):
         self.layers = nn.ModuleList([
             MVGDecoderLayer(d_model=self.d_model) for _ in range(self.n_layers)
         ])
+        # ---- 根据配置选择注意力模块 ----
+        attn_type = cfg.DECODER.cross_attention_type
         for layer in self.layers:
-            layer.proj_attn = ProjectiveAttention(
-                d_model=self.d_model, n_heads=cfg.DECODER.nhead,
-                n_levels=len(cfg.DECODER.use_feat_level), n_views=cfg.DATASET.CAMERA_NUM
-            )
+            if attn_type == 'vanilla':
+                layer.proj_attn = VanillaCrossAttention(
+                    d_model=self.d_model, n_heads=cfg.DECODER.nhead,
+                    n_levels=len(cfg.DECODER.use_feat_level), n_views=cfg.DATASET.CAMERA_NUM
+                )
+            else:  # 默认 'projective'
+                layer.proj_attn = ProjectiveAttention(
+                    d_model=self.d_model, n_heads=cfg.DECODER.nhead,
+                    n_levels=len(cfg.DECODER.use_feat_level), n_views=cfg.DATASET.CAMERA_NUM
+                )
         self.pose_embed = MLP(self.d_model, self.d_model, 3, 3)
         self.class_embed = nn.Linear(self.d_model, 1)
 

@@ -149,7 +149,8 @@ class DEXYCBDatasets(Dataset):
             extrinsic_config = yaml.load(file, Loader=yaml.FullLoader)["extrinsics"]
 
         all_view_dirs = sorted([d for d in os.listdir(seq_path) if os.path.isdir(os.path.join(seq_path, d))])
-        target_view_dirs = all_view_dirs
+        # target_view_dirs = all_view_dirs
+        target_view_dirs = all_view_dirs[:cfg.DATASET.CAMERA_NUM]
 
         target_w, target_h = cfg.NETWORK.IMAGE_SIZE
 

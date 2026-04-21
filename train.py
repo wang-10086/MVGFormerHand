@@ -17,6 +17,8 @@ import logging
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from collections import defaultdict
+import random
+import numpy as np
 
 # -----------------------------------------------------------------------------
 # 1. 导入配置与工具 (Imports)
@@ -210,6 +212,16 @@ def validate(model, dataloader, device):
 # -----------------------------------------------------------------------------
 def main():
     warnings.filterwarnings("ignore")
+
+    # 固定随机种子
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     exp_manager = ExperimentManager()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     exp_manager.log(f"Using device: {device}")
@@ -222,8 +234,11 @@ def main():
     train_dataset = DatasetClass(root_dir=root_dir, split='train', split_strategy=cfg.DATASET.SPLIT_STRATEGY)
     val_dataset = DatasetClass(root_dir=root_dir, split='test', split_strategy=cfg.DATASET.SPLIT_STRATEGY)
 
+    g = torch.Generator()
+    g.manual_seed(42)
+
     train_loader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=True,
-                              num_workers=cfg.TRAIN.NUM_WORKERS, drop_last=True)
+                              num_workers=cfg.TRAIN.NUM_WORKERS, drop_last=True, generator=g)
     val_loader = DataLoader(val_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=False,
                             num_workers=cfg.TRAIN.NUM_WORKERS, drop_last=False)
 
